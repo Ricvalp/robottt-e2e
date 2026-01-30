@@ -1,0 +1,13 @@
+jax==0.4.24
+jaxlib==0.4.24+cuda12.cudnn89
+# for CUDA 12 wheels; install via:
+# pip install --upgrade "jax[cuda12_pip]==0.4.24" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+flax>=0.7.5
+optax>=0.1.9
+tensorflow-datasets>=4.9.4
+ml-collections>=0.1.1
+wandb>=0.16.3
+matplotlib>=3.8
+numpy>=1.24
+scipy>=1.11
+orbax-checkpoint>=0.3.6

@@ -2,26 +2,22 @@ from ml_collections import ConfigDict
 
 
 def get_config() -> ConfigDict:
-
     cfg = ConfigDict()
 
     cfg.run = ConfigDict()
     cfg.run.seed = 42
-    cfg.run.device = "cuda"  # or "cpu"
+    cfg.run.device = "cuda"  # "cuda" or "cpu"
 
     cfg.data = ConfigDict()
-    cfg.data.root = "playground/data"
     cfg.data.image_size = 32
     cfg.data.batch_size = 64
     cfg.data.num_workers = 4
-    cfg.data.download = True
-    cfg.data.holdout_per_class = 200  # images held out per class for eval/adaptation
-    cfg.data.use_full_dataset = False  # if False, leave out one digit from training
-    cfg.data.leave_out_digit = 9      # digit excluded from training when use_full_dataset=False
-    cfg.data.leaveout_eval_holdout = 10000  # number of images of leave_out_digit used for eval/adaptation
+    cfg.data.holdout_per_class = 200
+    cfg.data.use_full_dataset = True
+    cfg.data.leave_out_digit = 9
+    cfg.data.leaveout_eval_holdout = 500
 
     cfg.model = ConfigDict()
-    cfg.model.in_channels = 1
     cfg.model.base_channels = 64
     cfg.model.channel_mults = (1, 2, 4)
     cfg.model.num_res_blocks = 2
@@ -35,50 +31,49 @@ def get_config() -> ConfigDict:
     cfg.diffusion.beta_end = 2e-2
 
     cfg.training = ConfigDict()
-    cfg.training.epochs = 500
-    cfg.training.steps_per_epoch = 500
+    cfg.training.epochs = 100
+    cfg.training.steps_per_epoch = 250
     cfg.training.outer_lr = 2e-4
-    cfg.training.inner_lr = 1e-3
-    cfg.training.inner_steps = 2
-    cfg.training.weight_decay = 0.0
+    cfg.training.inner_lr = 1e-2
+    cfg.training.inner_steps = 3
     cfg.training.grad_clip = 1.0
     cfg.training.use_amp = False
     cfg.training.log_every = 50
-    cfg.training.sample_every_epochs = 5
-    cfg.training.checkpoint_every_epochs = 5
+    cfg.training.sample_every_epochs = 1
+    cfg.training.checkpoint_every_epochs = 1
 
     cfg.eval = ConfigDict()
     cfg.eval.inner_steps = 1
     cfg.eval.inner_lr = 1e-3
 
     cfg.fast_params = ConfigDict()
-    cfg.fast_params.selector = "up_down_mid_head"  # only time MLPs in up blocks
+    cfg.fast_params.selector = "up_down_mid_full"  # default fast set
 
     cfg.sample = ConfigDict()
     cfg.sample.num_images = 16
     cfg.sample.steps = 100
-    cfg.sample.dir = "playground/maml_samples"
+    cfg.sample.dir = "playground_jax/samples"
 
     cfg.counting = ConfigDict()
     cfg.counting.use = True
     cfg.counting.num_samples = 3000
     cfg.counting.batch_size = 256
-    cfg.counting.classifier_ckpt = "playground/classifier_checkpoints/classifier_epoch_010.pt"
+    cfg.counting.classifier_ckpt = "playground_jax/classifier_checkpoints/ckpt.npz"
 
     cfg.fid = ConfigDict()
     cfg.fid.use = True
     cfg.fid.num_samples = 3000
     cfg.fid.batch_size = 256
-    cfg.fid.stats_path = "playground/fid_stats_classifier.json"
+    cfg.fid.stats_path = "playground_jax/fid_stats_classifier.json"
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "playground/maml_checkpoints"
+    cfg.checkpoint.dir = "playground_jax/checkpoints"
     cfg.checkpoint.resume = ""
 
     cfg.wandb = ConfigDict()
-    cfg.wandb.use = True
-    cfg.wandb.project = "ddpm-maml-mnist"
-    cfg.wandb.entity = "ricvalp"
+    cfg.wandb.use = False
+    cfg.wandb.project = "ddpm-maml-mnist-jax"
+    cfg.wandb.entity = None
     cfg.wandb.run_name = None
     cfg.wandb.dir = None
 
