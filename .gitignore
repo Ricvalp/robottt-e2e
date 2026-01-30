@@ -1,0 +1,35 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# virtual envs
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# experiment artifacts
+wandb/
+playground/wandb/
+playground/maml_samples/
+playground/maml_checkpoints/
+playground/checkpoints/
+playground/classifier_checkpoints/
+
+# data
+data/
+playground/data/
+
+# logs
+*.log
+
+metrics/index/
+metrics/checkpoints/
+profiling/
