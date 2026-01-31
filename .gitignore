@@ -22,6 +22,10 @@ playground/maml_samples/
 playground/maml_checkpoints/
 playground/checkpoints/
 playground/classifier_checkpoints/
+playground/checkpoint*
+
+checkpoints_cond/
+
 
 # data
 data/
