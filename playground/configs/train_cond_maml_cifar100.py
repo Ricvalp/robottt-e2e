@@ -56,7 +56,7 @@ def get_config():
     cfg.wandb = ConfigDict()
     cfg.wandb.use = False
     cfg.wandb.project = "ddpm-maml-cifar100-cond"
-    cfg.wandb.entity = None
+    cfg.wandb.entity = "ricvalp"
     cfg.wandb.run_name = "ddpm-maml-cifar100-cond"
     cfg.wandb.dir = "."
 

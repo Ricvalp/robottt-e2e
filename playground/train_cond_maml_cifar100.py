@@ -40,7 +40,6 @@ def log_denoise(ddpm: DDPM, imgs: torch.Tensor, cond_imgs: torch.Tensor, device:
         grid = utils.make_grid(vis, nrow=max_imgs)
         wandb_run.log({"debug/x_t_and_x0": wandb.Image(grid)}, step=global_step)
 
-
 # -------------------------
 # Utilities
 # -------------------------
@@ -421,7 +420,6 @@ def train(cfg: ConfigDict) -> None:
             if global_step % cfg.training.log_every == 0:
                 if wandb_run is not None:
                     wandb.log({"train/outer_loss": outer_loss.item()}, step=global_step)
-                    log_denoise(ddpm, imgs, cond_imgs, device, wandb_run, global_step)
 
         if epoch % cfg.training.sample_every_epochs == 0:
             ddpm.eval()
@@ -432,6 +430,7 @@ def train(cfg: ConfigDict) -> None:
             grid, target_grid = adapt_and_sample(ddpm, fast_names, base_params, val_imgs, val_cond, cfg, device)
             if wandb_run is not None:
                 wandb.log({"samples": wandb.Image(grid), "target_samples": wandb.Image(target_grid), "eval_class": cls}, step=global_step)
+                log_denoise(ddpm, imgs, cond_imgs, device, wandb_run, global_step)
 
             # also log adaptation on a training class
             train_cls = random.choice(train_classes)
