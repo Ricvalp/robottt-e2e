@@ -313,40 +313,40 @@ def train(cfg: ConfigDict) -> None:
             if global_step % cfg.training.log_every == 0 and wandb_run is not None:
                 wandb.log({"train/loss": loss.item()}, step=global_step)
 
-            avg_loss = epoch_loss / max(num_batches, 1)
-            if is_main_process():
-                print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f}")
+        avg_loss = epoch_loss / max(num_batches, 1)
+        if is_main_process():
+            print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f}")
 
-            # Sample and log
-            if epoch % cfg.training.sample_every_epochs == 0:
-                log_samples(ddpm_module, device, cfg, wandb_run, global_step)
-                if dist.is_initialized():
-                    dist.barrier()  # Sync all processes after sampling
+        # Sample and log
+        if epoch % cfg.training.sample_every_epochs == 0:
+            log_samples(ddpm_module, device, cfg, wandb_run, global_step)
+            if dist.is_initialized():
+                dist.barrier()  # Sync all processes after sampling
 
-            # FID evaluation
-            if cfg.fid.enabled and epoch % cfg.training.fid_every_epochs == 0:
-                fid_score = compute_fid_score(ddpm_module, cfg, device)
-                if fid_score is not None:
-                    print(f"  FID score: {fid_score:.2f}")
-                    if wandb_run is not None:
-                        wandb.log({"eval/fid": fid_score}, step=global_step)
-                if dist.is_initialized():
-                    dist.barrier()  # Sync all processes after FID computation
+        # FID evaluation
+        if cfg.fid.enabled and epoch % cfg.training.fid_every_epochs == 0:
+            fid_score = compute_fid_score(ddpm_module, cfg, device)
+            if fid_score is not None:
+                print(f"  FID score: {fid_score:.2f}")
+                if wandb_run is not None:
+                    wandb.log({"eval/fid": fid_score}, step=global_step)
+            if dist.is_initialized():
+                dist.barrier()  # Sync all processes after FID computation
 
-            # Checkpoint (main process only)
-            if is_main_process() and epoch % cfg.training.checkpoint_every_epochs == 0:
-                ckpt_path = run_save_dir / f"imagenet_epoch_{epoch:03d}.pt"
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "global_step": global_step,
-                        "model": ddpm_module.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scaler": scaler.state_dict(),
-                        "cfg": cfg.to_dict(),
-                    },
-                    ckpt_path,
-                )
+        # Checkpoint (main process only)
+        if is_main_process() and epoch % cfg.training.checkpoint_every_epochs == 0:
+            ckpt_path = run_save_dir / f"imagenet_epoch_{epoch:03d}.pt"
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "model": ddpm_module.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "cfg": cfg.to_dict(),
+                },
+                ckpt_path,
+            )
 
     if wandb_run is not None:
         wandb_run.finish()
