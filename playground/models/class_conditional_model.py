@@ -266,6 +266,7 @@ class DDPM(nn.Module):
     """
     Continuous-time DDPM with v-prediction and classifier-free guidance.
     Uses Kingma VDM parameterization with log-SNR schedule.
+    Supports min-SNR-γ loss weighting for improved training stability.
     """
 
     def __init__(
@@ -274,12 +275,14 @@ class DDPM(nn.Module):
         log_snr_max: float = 5.0,
         log_snr_min: float = -15.0,
         cfg_drop_prob: float = 0.1,
+        min_snr_gamma: float = 5.0,
     ) -> None:
         super().__init__()
         self.model = model
         self.log_snr_max = log_snr_max  # log-SNR at t=0 (high SNR, clean image)
         self.log_snr_min = log_snr_min  # log-SNR at t=1 (low SNR, pure noise)
         self.cfg_drop_prob = cfg_drop_prob
+        self.min_snr_gamma = min_snr_gamma  # min-SNR-γ weighting (0 to disable)
 
     def _log_snr(self, t: torch.Tensor) -> torch.Tensor:
         """Linear interpolation of log-SNR from max to min."""
@@ -309,7 +312,7 @@ class DDPM(nn.Module):
         t: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute training loss with random class dropout for CFG."""
+        """Compute training loss with random class dropout for CFG and min-SNR-γ weighting."""
         if t is None:
             t = torch.rand(x0.shape[0], device=x0.device)
         if noise is None:
@@ -324,7 +327,21 @@ class DDPM(nn.Module):
         x_t, alpha, sigma = self.q_sample(x0, t, noise)
         v_target = alpha[:, None, None, None] * noise - sigma[:, None, None, None] * x0
         v_pred = self.model(x_t, t, class_ids)
-        return F.mse_loss(v_pred, v_target)
+        
+        # Compute per-sample MSE loss
+        mse_loss = F.mse_loss(v_pred, v_target, reduction='none').mean(dim=[1, 2, 3])
+        
+        # Apply min-SNR-γ weighting if enabled
+        if self.min_snr_gamma > 0:
+            # SNR = exp(log_snr)
+            log_snr = self._log_snr(t)
+            snr = torch.exp(log_snr)
+            # min-SNR-γ weight: min(SNR, γ) / SNR = min(1, γ/SNR)
+            # This down-weights high-SNR timesteps and clips at γ for low-SNR
+            weight = torch.clamp(snr, max=self.min_snr_gamma) / snr
+            mse_loss = weight * mse_loss
+        
+        return mse_loss.mean()
 
     @torch.no_grad()
     def _predict_eps_x0(self, x_t: torch.Tensor, t: torch.Tensor, v_pred: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

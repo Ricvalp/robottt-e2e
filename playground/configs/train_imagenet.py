@@ -29,8 +29,8 @@ def get_config():
     cfg.diffusion = ConfigDict()
     cfg.diffusion.log_snr_max = 5.0
     cfg.diffusion.log_snr_min = -15.0
-    
     cfg.diffusion.cfg_drop_prob = 0.1
+    cfg.diffusion.min_snr_gamma = 5.0  # min-SNR-γ loss weighting (0 to disable)
 
     cfg.training = ConfigDict()
     cfg.training.epochs = 300
@@ -49,9 +49,9 @@ def get_config():
     cfg.sample.cfg_scale = 3.0
 
     cfg.fid = ConfigDict()
-    cfg.fid.enabled = True  # Enable when ready to compute FID
-    cfg.fid.num_samples = 1000
-    cfg.fid.batch_size = 256
+    cfg.fid.enabled = True
+    cfg.fid.num_samples = 5000
+    cfg.fid.batch_size = 512
     cfg.fid.stats_file = "playground/fid_stats_classifier.json"
 
     cfg.wandb = ConfigDict()
