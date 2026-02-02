@@ -63,7 +63,7 @@ def get_config() -> ConfigDict:
     cfg.counting.use = True
     cfg.counting.num_samples = 3000
     cfg.counting.batch_size = 256
-    cfg.counting.classifier_ckpt = "playground/classifier_checkpoints/classifier_epoch_010.pt"
+    cfg.counting.classifier_ckpt = "playground/classifier_checkpoints/mnist/classifier_epoch_010.pt"
 
     cfg.fid = ConfigDict()
     cfg.fid.use = True

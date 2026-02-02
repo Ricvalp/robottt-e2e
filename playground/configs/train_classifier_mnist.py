@@ -32,7 +32,7 @@ def get_config() -> ConfigDict:
     cfg.eval.batch_size = 512
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "playground/classifier_checkpoints"
+    cfg.checkpoint.dir = "playground/classifier_checkpoints/mnist"
     cfg.checkpoint.resume = ""
 
     cfg.wandb = ConfigDict()

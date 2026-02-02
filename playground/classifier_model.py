@@ -33,10 +33,10 @@ class BasicBlock(nn.Module):
 
 
 class SmallResNet(nn.Module):
-    def __init__(self, width: int = 64, num_blocks: int = 3, num_classes: int = 10, dropout: float = 0.1):
+    def __init__(self, width: int = 64, num_blocks: int = 3, num_classes: int = 10, dropout: float = 0.1, in_channels: int = 1):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(1, width, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Conv2d(in_channels, width, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(width),
             nn.ReLU(inplace=True),
         )
