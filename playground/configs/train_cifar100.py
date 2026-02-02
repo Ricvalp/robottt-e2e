@@ -42,7 +42,7 @@ def get_config():
     cfg.training.sample_every_epochs = 5
     cfg.training.log_every = 50
     cfg.training.checkpoint_every_epochs = 20
-    cfg.training.fid_every_epochs = 5
+    cfg.training.fid_every_epochs = 1
 
     cfg.sample = ConfigDict()
     cfg.sample.num_images = 16

@@ -9,8 +9,8 @@ def get_config():
     cfg.run.device = "cuda"
 
     cfg.data = ConfigDict()
-    cfg.data.train_dir = "/data/imagenet/train"  # UPDATE THIS PATH
-    cfg.data.val_dir = "/data/imagenet/val"      # UPDATE THIS PATH
+    cfg.data.train_dir = "/mnt/external_storage/torchvision_ImageFolder/train"
+    cfg.data.val_dir = "/mnt/external_storage/torchvision_ImageFolder/val"
     cfg.data.image_size = 64
     cfg.data.batch_size = 64  # Per GPU
     cfg.data.num_workers = 8
