@@ -49,15 +49,15 @@ def get_config():
     cfg.sample.cfg_scale = 3.0
 
     cfg.fid = ConfigDict()
-    cfg.fid.enabled = False  # Enable when ready to compute FID
+    cfg.fid.enabled = True  # Enable when ready to compute FID
     cfg.fid.num_samples = 1000
     cfg.fid.batch_size = 256
     cfg.fid.stats_file = "playground/fid_stats_classifier.json"
 
     cfg.wandb = ConfigDict()
-    cfg.wandb.use = False
+    cfg.wandb.use = True
     cfg.wandb.project = "ddpm-imagenet64-class-cond"
-    cfg.wandb.entity = None
+    cfg.wandb.entity = "ricvalp"
     cfg.wandb.run_name = "ddpm-imagenet64"
     cfg.wandb.dir = "."
 

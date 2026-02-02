@@ -137,7 +137,7 @@ def compute_fid_score(
     cfg: ConfigDict,
     device: torch.device,
 ) -> Optional[float]:
-    """Compute FID score using InceptionV3 (standard FID)."""
+    """Compute FID score using InceptionV3 (standard FID) with class-balanced sampling."""
     if not is_main_process():
         return None
     
@@ -164,8 +164,8 @@ def compute_fid_score(
             transforms.ToTensor(),
         ])
         ref_dataset = datasets.ImageFolder(cfg.data.train_dir, transform=transform)
-        # Use subset for faster computation (10k samples)
-        subset_size = min(10000, len(ref_dataset))
+        # Use 50k samples for standard FID (matches common benchmark protocol)
+        subset_size = min(50000, len(ref_dataset))
         indices = torch.randperm(len(ref_dataset))[:subset_size].tolist()
         ref_subset = torch.utils.data.Subset(ref_dataset, indices)
         ref_loader = DataLoader(ref_subset, batch_size=64, shuffle=False, num_workers=4)
@@ -175,30 +175,43 @@ def compute_fid_score(
     # Load reference stats
     reference_stats = load_fid_stats(stats_file, dataset_key)
     
-    print("Computing FID score...")
+    print("Computing FID score (class-balanced sampling)...")
     
-    # Generate samples
+    # Generate samples with class-balanced sampling
+    # This ensures equal representation of all classes for proper class-conditional FID
     ddpm_module.eval()
     num_samples = cfg.fid.num_samples
     batch_size = getattr(cfg.fid, 'batch_size', 256)
-    all_samples = []
-    
     num_classes = cfg.model.num_classes
     
+    # Calculate samples per class (round up to ensure we get at least num_samples total)
+    samples_per_class = (num_samples + num_classes - 1) // num_classes
+    all_samples = []
+    
     with torch.no_grad():
-        for i in tqdm(range(0, num_samples, batch_size), desc="Generating samples for FID"):
-            curr_batch = min(batch_size, num_samples - i)
-            class_ids = torch.randint(0, num_classes, (curr_batch,), device=device)
-            samples = ddpm_module.sample(
-                class_ids,
-                shape=(cfg.model.in_channels, cfg.data.image_size, cfg.data.image_size),
-                device=device,
-                steps=cfg.sample.steps,
-                cfg_scale=cfg.sample.cfg_scale,
-            )
-            all_samples.append(samples.cpu())
+        for cls in tqdm(range(num_classes), desc="Generating samples for FID (per class)"):
+            # Generate samples_per_class samples for this class in batches
+            class_samples = []
+            remaining = samples_per_class
+            
+            while remaining > 0:
+                curr_batch = min(batch_size, remaining)
+                class_ids = torch.full((curr_batch,), cls, device=device, dtype=torch.long)
+                samples = ddpm_module.sample(
+                    class_ids,
+                    shape=(cfg.model.in_channels, cfg.data.image_size, cfg.data.image_size),
+                    device=device,
+                    steps=cfg.sample.steps,
+                    cfg_scale=cfg.sample.cfg_scale,
+                )
+                class_samples.append(samples.cpu())
+                remaining -= curr_batch
+            
+            all_samples.extend(class_samples)
     
     all_samples = torch.cat(all_samples, dim=0)
+    # Trim to exact num_samples if we generated more due to rounding
+    all_samples = all_samples[:num_samples]
     
     # Compute FID using InceptionV3
     fid_score = compute_fid_inception(all_samples, reference_stats, device)
@@ -239,7 +252,6 @@ def train(cfg: ConfigDict) -> None:
         model,
         log_snr_max=cfg.diffusion.log_snr_max,
         log_snr_min=cfg.diffusion.log_snr_min,
-        
         cfg_drop_prob=cfg.diffusion.cfg_drop_prob,
     ).to(device)
 
@@ -253,7 +265,7 @@ def train(cfg: ConfigDict) -> None:
         print(f"Model parameters: {n_params/1e6:.2f}M ({n_params})")
 
     optimizer = optim.AdamW(ddpm.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
-    scaler = amp.GradScaler(device=device.type, enabled=cfg.training.use_amp)
+    scaler = amp.GradScaler(enabled=cfg.training.use_amp)
 
     wandb_run = None
     run_save_dir = Path(cfg.checkpoint.dir)
@@ -265,8 +277,9 @@ def train(cfg: ConfigDict) -> None:
             dir=cfg.wandb.dir,
             config=cfg.to_dict(),
         )
-        wandb.run.name = wandb.run.id
-        run_save_dir = Path(cfg.checkpoint.dir) / wandb.run.id
+        if wandb.run is not None:
+            wandb.run.name = wandb.run.id
+            run_save_dir = Path(cfg.checkpoint.dir) / wandb.run.id
     if is_main_process():
         run_save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -287,7 +300,7 @@ def train(cfg: ConfigDict) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with amp.autocast(device_type=device.type, enabled=cfg.training.use_amp):
-                loss = ddpm_module.p_losses(imgs, labels) if isinstance(ddpm, DDP) else ddpm.p_losses(imgs, labels)
+                loss = ddpm_module.p_losses(imgs, labels)
             
             scaler.scale(loss).backward()
             if cfg.training.grad_clip is not None:
@@ -313,6 +326,8 @@ def train(cfg: ConfigDict) -> None:
         # Sample and log
         if epoch % cfg.training.sample_every_epochs == 0:
             log_samples(ddpm_module, device, cfg, wandb_run, global_step)
+            if dist.is_initialized():
+                dist.barrier()  # Sync all processes after sampling
 
         # FID evaluation
         if cfg.fid.enabled and epoch % cfg.training.fid_every_epochs == 0:
@@ -321,6 +336,8 @@ def train(cfg: ConfigDict) -> None:
                 print(f"  FID score: {fid_score:.2f}")
                 if wandb_run is not None:
                     wandb.log({"eval/fid": fid_score}, step=global_step)
+            if dist.is_initialized():
+                dist.barrier()  # Sync all processes after FID computation
 
         # Checkpoint (main process only)
         if is_main_process() and epoch % cfg.training.checkpoint_every_epochs == 0:
