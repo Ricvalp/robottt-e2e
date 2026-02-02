@@ -27,9 +27,9 @@ def get_config():
     cfg.model.cond_dim = 256
 
     cfg.diffusion = ConfigDict()
-    cfg.diffusion.beta_start = 1e-4
-    cfg.diffusion.beta_end = 0.02
-    cfg.diffusion.train_steps = 1000
+    cfg.diffusion.log_snr_max = 5.0
+    cfg.diffusion.log_snr_min = -15.0
+    
     cfg.diffusion.cfg_drop_prob = 0.1
 
     cfg.training = ConfigDict()

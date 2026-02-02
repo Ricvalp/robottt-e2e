@@ -226,16 +226,16 @@ def train(cfg: ConfigDict) -> None:
         attn_resolutions=tuple(cfg.model.attn_resolutions),
         num_heads=cfg.model.num_heads,
         image_size=cfg.data.image_size,
-        time_scale=cfg.diffusion.train_steps,
+        time_scale=1000.0,  # Standard time embedding scale
         num_classes=1,  # 1 class = unconditional (null class only)
         cond_dim=cfg.model.cond_dim,
     ).to(device)
 
     ddpm = DDPM(
         model,
-        beta_start=cfg.diffusion.beta_start,
-        beta_end=cfg.diffusion.beta_end,
-        train_steps=cfg.diffusion.train_steps,
+        log_snr_max=cfg.diffusion.log_snr_max,
+        log_snr_min=cfg.diffusion.log_snr_min,
+        
         cfg_drop_prob=0.0,  # No CFG for unconditional
     ).to(device)
 

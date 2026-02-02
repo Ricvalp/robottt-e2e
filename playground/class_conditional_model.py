@@ -265,36 +265,35 @@ class ClassCondUNet(nn.Module):
 class DDPM(nn.Module):
     """
     Continuous-time DDPM with v-prediction and classifier-free guidance.
+    Uses Kingma VDM parameterization with log-SNR schedule.
     """
 
     def __init__(
         self,
         model: ClassCondUNet,
-        beta_start: float,
-        beta_end: float,
-        train_steps: int = 1000,
+        log_snr_max: float = 5.0,
+        log_snr_min: float = -15.0,
         cfg_drop_prob: float = 0.1,
     ) -> None:
         super().__init__()
         self.model = model
-        self.beta_start = beta_start
-        self.beta_end = beta_end
-        self.train_steps = train_steps
+        self.log_snr_max = log_snr_max  # log-SNR at t=0 (high SNR, clean image)
+        self.log_snr_min = log_snr_min  # log-SNR at t=1 (low SNR, pure noise)
         self.cfg_drop_prob = cfg_drop_prob
 
-    @property
-    def num_timesteps(self) -> int:
-        return self.train_steps
-
-    def _alpha_bar(self, t: torch.Tensor) -> torch.Tensor:
-        T = float(self.train_steps)
-        return torch.exp(-self.beta_start * T * t - 0.5 * (self.beta_end - self.beta_start) * T * t * t)
+    def _log_snr(self, t: torch.Tensor) -> torch.Tensor:
+        """Linear interpolation of log-SNR from max to min."""
+        return self.log_snr_max + t * (self.log_snr_min - self.log_snr_max)
 
     def _alpha_sigma(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        alpha_bar = self._alpha_bar(t)
-        alpha = torch.sqrt(alpha_bar)
-        sigma = torch.sqrt(1.0 - alpha_bar)
-        return alpha, sigma
+        """
+        Compute α(t) and σ(t) from log-SNR using variance-preserving constraint.
+        α² + σ² = 1, SNR = α²/σ²
+        """
+        log_snr = self._log_snr(t)
+        alpha_sq = torch.sigmoid(log_snr)
+        sigma_sq = torch.sigmoid(-log_snr)
+        return torch.sqrt(alpha_sq), torch.sqrt(sigma_sq)
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if noise is None:

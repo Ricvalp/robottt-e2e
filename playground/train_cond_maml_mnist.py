@@ -343,7 +343,7 @@ def train(cfg: ConfigDict) -> None:
         cross_attn_resolutions=tuple(cfg.model.cross_attn_resolutions),
         num_heads=cfg.model.num_heads,
         image_size=cfg.data.image_size,
-        time_scale=cfg.diffusion.train_steps,
+        time_scale=1000.0,  # Standard time embedding scale
         cond_dim=cfg.model.cond_dim,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -351,9 +351,9 @@ def train(cfg: ConfigDict) -> None:
 
     ddpm = DDPM(
         model,
-        beta_start=cfg.diffusion.beta_start,
-        beta_end=cfg.diffusion.beta_end,
-        train_steps=cfg.diffusion.train_steps,
+        log_snr_max=cfg.diffusion.log_snr_max,
+        log_snr_min=cfg.diffusion.log_snr_min,
+        
     ).to(device)
 
     fast_names, fast_params = select_fast_params(model, cfg.fast_params.selector)

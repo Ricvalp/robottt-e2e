@@ -28,8 +28,8 @@ def get_config() -> ConfigDict:
     cfg.model.num_heads = 4
 
     cfg.diffusion = ConfigDict()
-    cfg.diffusion.train_steps = 1000  # time scaling for continuous diffusion
-    cfg.diffusion.beta_start = 1e-4
+      # time scaling for continuous diffusion
+    cfg.diffusion.log_snr_max = 5.0
     cfg.diffusion.beta_end = 2e-2
 
     cfg.training = ConfigDict()

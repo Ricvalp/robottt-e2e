@@ -57,7 +57,7 @@ def main(argv=None):
         attn_resolutions=tuple(cfg.model.attn_resolutions),
         num_heads=cfg.model.num_heads,
         image_size=cfg.data.image_size,
-        time_scale=cfg.diffusion.train_steps,
+        time_scale=1000.0,  # Standard time embedding scale
     ).to(device)
 
     ddpm = DDPM(
