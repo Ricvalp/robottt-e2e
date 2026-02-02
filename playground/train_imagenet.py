@@ -174,44 +174,37 @@ def compute_fid_score(
     
     # Load reference stats
     reference_stats = load_fid_stats(stats_file, dataset_key)
-    
+
     print("Computing FID score (class-balanced sampling)...")
-    
+
     # Generate samples with class-balanced sampling
-    # This ensures equal representation of all classes for proper class-conditional FID
+    # Uses round-robin class assignment for efficiency while maintaining balance
     ddpm_module.eval()
     num_samples = cfg.fid.num_samples
     batch_size = getattr(cfg.fid, 'batch_size', 256)
     num_classes = cfg.model.num_classes
-    
-    # Calculate samples per class (round up to ensure we get at least num_samples total)
-    samples_per_class = (num_samples + num_classes - 1) // num_classes
     all_samples = []
-    
+
     with torch.no_grad():
-        for cls in tqdm(range(num_classes), desc="Generating samples for FID (per class)"):
-            # Generate samples_per_class samples for this class in batches
-            class_samples = []
-            remaining = samples_per_class
-            
-            while remaining > 0:
-                curr_batch = min(batch_size, remaining)
-                class_ids = torch.full((curr_batch,), cls, device=device, dtype=torch.long)
-                samples = ddpm_module.sample(
-                    class_ids,
-                    shape=(cfg.model.in_channels, cfg.data.image_size, cfg.data.image_size),
-                    device=device,
-                    steps=cfg.sample.steps,
-                    cfg_scale=cfg.sample.cfg_scale,
-                )
-                class_samples.append(samples.cpu())
-                remaining -= curr_batch
-            
-            all_samples.extend(class_samples)
-    
+        for i in tqdm(range(0, num_samples, batch_size), desc="Generating samples for FID"):
+            curr_batch = min(batch_size, num_samples - i)
+            # Round-robin class assignment for class-balanced sampling
+            # Sample i gets class (i % num_classes)
+            class_ids = torch.tensor(
+                [(i + j) % num_classes for j in range(curr_batch)],
+                device=device,
+                dtype=torch.long,
+            )
+            samples = ddpm_module.sample(
+                class_ids,
+                shape=(cfg.model.in_channels, cfg.data.image_size, cfg.data.image_size),
+                device=device,
+                steps=cfg.sample.steps,
+                cfg_scale=cfg.sample.cfg_scale,
+            )
+            all_samples.append(samples.cpu())
+
     all_samples = torch.cat(all_samples, dim=0)
-    # Trim to exact num_samples if we generated more due to rounding
-    all_samples = all_samples[:num_samples]
     
     # Compute FID using InceptionV3
     fid_score = compute_fid_inception(all_samples, reference_stats, device)
@@ -320,40 +313,40 @@ def train(cfg: ConfigDict) -> None:
             if global_step % cfg.training.log_every == 0 and wandb_run is not None:
                 wandb.log({"train/loss": loss.item()}, step=global_step)
 
-        avg_loss = epoch_loss / max(num_batches, 1)
-        if is_main_process():
-            print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f}")
+            avg_loss = epoch_loss / max(num_batches, 1)
+            if is_main_process():
+                print(f"[Epoch {epoch}] avg_loss={avg_loss:.4f}")
 
-        # Sample and log
-        if epoch % cfg.training.sample_every_epochs == 0:
-            log_samples(ddpm_module, device, cfg, wandb_run, global_step)
-            if dist.is_initialized():
-                dist.barrier()  # Sync all processes after sampling
+            # Sample and log
+            if epoch % cfg.training.sample_every_epochs == 0:
+                log_samples(ddpm_module, device, cfg, wandb_run, global_step)
+                if dist.is_initialized():
+                    dist.barrier()  # Sync all processes after sampling
 
-        # FID evaluation
-        if cfg.fid.enabled and epoch % cfg.training.fid_every_epochs == 0:
-            fid_score = compute_fid_score(ddpm_module, cfg, device)
-            if fid_score is not None:
-                print(f"  FID score: {fid_score:.2f}")
-                if wandb_run is not None:
-                    wandb.log({"eval/fid": fid_score}, step=global_step)
-            if dist.is_initialized():
-                dist.barrier()  # Sync all processes after FID computation
+            # FID evaluation
+            if cfg.fid.enabled and epoch % cfg.training.fid_every_epochs == 0:
+                fid_score = compute_fid_score(ddpm_module, cfg, device)
+                if fid_score is not None:
+                    print(f"  FID score: {fid_score:.2f}")
+                    if wandb_run is not None:
+                        wandb.log({"eval/fid": fid_score}, step=global_step)
+                if dist.is_initialized():
+                    dist.barrier()  # Sync all processes after FID computation
 
-        # Checkpoint (main process only)
-        if is_main_process() and epoch % cfg.training.checkpoint_every_epochs == 0:
-            ckpt_path = run_save_dir / f"imagenet_epoch_{epoch:03d}.pt"
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "model": ddpm_module.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scaler": scaler.state_dict(),
-                    "cfg": cfg.to_dict(),
-                },
-                ckpt_path,
-            )
+            # Checkpoint (main process only)
+            if is_main_process() and epoch % cfg.training.checkpoint_every_epochs == 0:
+                ckpt_path = run_save_dir / f"imagenet_epoch_{epoch:03d}.pt"
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "model": ddpm_module.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scaler": scaler.state_dict(),
+                        "cfg": cfg.to_dict(),
+                    },
+                    ckpt_path,
+                )
 
     if wandb_run is not None:
         wandb_run.finish()

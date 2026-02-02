@@ -38,10 +38,10 @@ def get_config():
     cfg.training.weight_decay = 0.0
     cfg.training.grad_clip = 1.0
     cfg.training.use_amp = True
-    cfg.training.sample_every_epochs = 10
+    cfg.training.sample_every_epochs = 1
     cfg.training.log_every = 100
-    cfg.training.checkpoint_every_epochs = 20
-    cfg.training.fid_every_epochs = 50
+    cfg.training.checkpoint_every_epochs = 5
+    cfg.training.fid_every_epochs = 1
 
     cfg.sample = ConfigDict()
     cfg.sample.num_images = 24
