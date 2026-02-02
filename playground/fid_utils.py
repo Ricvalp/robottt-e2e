@@ -339,7 +339,7 @@ def load_classifier_for_fid(
     device: torch.device = None,
 ) -> nn.Module:
     """Load a trained SmallResNet classifier for FID computation."""
-    from classifier_model import SmallResNet
+    from playground.models.classifier_model import SmallResNet
     
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -26,7 +26,7 @@ from torchvision import datasets, transforms, utils
 import wandb
 from tqdm import tqdm
 
-from class_conditional_model import ClassCondUNet, DDPM
+from playground.models.class_conditional_model import ClassCondUNet, DDPM
 
 
 # -------------------------

@@ -15,7 +15,7 @@ from torchvision import datasets, transforms
 import wandb
 from tqdm import tqdm
 
-from classifier_model import SmallResNet
+from playground.models.classifier_model import SmallResNet
 
 
 # -------------------------
@@ -166,7 +166,7 @@ def train(cfg: ConfigDict) -> None:
 # -------------------------
 
 _CONFIG = config_flags.DEFINE_config_file(
-    "classifier_config",
+    "config",
     default="playground/configs/train_classifier_cifar100.py",
     help_string="Path to ml_collections config file.",
 )

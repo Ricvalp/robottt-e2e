@@ -16,7 +16,7 @@ from torchvision import datasets, transforms, utils
 import wandb
 from tqdm import tqdm
 
-from class_conditional_model import ClassCondUNet, DDPM
+from playground.models.class_conditional_model import ClassCondUNet, DDPM
 
 
 # -------------------------
@@ -161,7 +161,7 @@ def compute_fid_score(
         for i in tqdm(range(0, num_samples, batch_size), desc="Generating samples for FID"):
             curr_batch = min(batch_size, num_samples - i)
             # Distribute classes evenly across batch
-            class_ids = torch.arange(curr_batch, device=device) % num_classes
+            class_ids = torch.randint(0, num_classes, (curr_batch,), device=device)
             samples = ddpm.sample(
                 class_ids,
                 shape=(cfg.model.in_channels, cfg.data.image_size, cfg.data.image_size),

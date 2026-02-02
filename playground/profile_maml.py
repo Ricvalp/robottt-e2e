@@ -17,7 +17,7 @@ import torch.amp as amp
 from torch.profiler import profile, ProfilerActivity
 
 import train_maml_mnist as tm
-from model import UNet, DDPM
+from playground.models.model import UNet, DDPM
 
 
 _CONFIG = config_flags.DEFINE_config_file(

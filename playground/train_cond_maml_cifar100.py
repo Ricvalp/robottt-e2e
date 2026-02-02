@@ -16,7 +16,7 @@ import wandb
 from tqdm import tqdm
 import torch.func as func
 
-from conditional_model import ConditionalUNet, DDPM, ResBlockCond
+from playground.models.conditional_model import ConditionalUNet, DDPM, ResBlockCond
 
 
 # -------------------------
@@ -356,8 +356,7 @@ def train(cfg: ConfigDict) -> None:
     ddpm = DDPM(
         model,
         log_snr_max=cfg.diffusion.log_snr_max,
-        log_snr_min=cfg.diffusion.log_snr_min,
-        
+        log_snr_min=cfg.diffusion.log_snr_min,     
     ).to(device)
 
     fast_names, fast_params = select_fast_params(model, cfg.fast_params.selector)

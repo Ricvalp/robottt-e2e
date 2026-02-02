@@ -15,7 +15,7 @@ from torchvision import datasets, transforms
 import wandb
 from tqdm import tqdm
 
-from classifier_model import SmallResNet
+from playground.models.classifier_model import SmallResNet
 
 
 # -------------------------

@@ -16,7 +16,7 @@ import wandb
 from tqdm import tqdm
 import torch.func as func
 
-from conditional_model import ConditionalUNet, DDPM, ResBlockCond
+from playground.models.conditional_model import ConditionalUNet, DDPM, ResBlockCond
 
 
 # -------------------------
