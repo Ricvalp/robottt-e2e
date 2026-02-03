@@ -311,6 +311,8 @@ def train(cfg: ConfigDict) -> None:
 
             if global_step % cfg.training.log_every == 0 and wandb_run is not None:
                 wandb.log({"train/loss": loss.item()}, step=global_step)
+            
+            break
 
         avg_loss = epoch_loss / max(num_batches, 1)
         if is_main_process():

@@ -51,7 +51,7 @@ def get_config():
 
     cfg.fid = ConfigDict()
     cfg.fid.enabled = True
-    cfg.fid.num_samples = 5000
+    cfg.fid.num_samples = 1000
     cfg.fid.batch_size = 512
     cfg.fid.stats_file = os.environ.get("FID_STATS_FILE", "fid_stats_classifier.json")
 

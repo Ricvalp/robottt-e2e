@@ -37,3 +37,5 @@ playground/data/
 metrics/index/
 metrics/checkpoints/
 profiling/
+
+playground/env.sh
