@@ -1,3 +1,4 @@
+import os
 from ml_collections import ConfigDict
 
 
@@ -9,7 +10,7 @@ def get_config():
     cfg.run.device = "cuda"
 
     cfg.data = ConfigDict()
-    cfg.data.root = "data"  # CelebA will be downloaded here
+    cfg.data.root = os.environ.get("PLAYGROUND_DATA_ROOT", "data")
     cfg.data.download = True
     cfg.data.image_size = 64
     cfg.data.batch_size = 64  # Per GPU
@@ -49,7 +50,7 @@ def get_config():
     cfg.fid.enabled = False  # Enable when ready to compute FID
     cfg.fid.num_samples = 1000
     cfg.fid.batch_size = 256
-    cfg.fid.stats_file = "playground/fid_stats_classifier.json"
+    cfg.fid.stats_file = os.environ.get("FID_STATS_FILE", "fid_stats_classifier.json")
 
     cfg.wandb = ConfigDict()
     cfg.wandb.use = False
@@ -59,6 +60,6 @@ def get_config():
     cfg.wandb.dir = "."
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "playground/checkpoints_celeba"
+    cfg.checkpoint.dir = os.path.join(os.environ.get("PLAYGROUND_CHECKPOINT_DIR", "checkpoints"), "celeba")
 
     return cfg

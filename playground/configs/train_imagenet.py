@@ -1,3 +1,4 @@
+import os
 from ml_collections import ConfigDict
 
 
@@ -9,8 +10,8 @@ def get_config():
     cfg.run.device = "cuda"
 
     cfg.data = ConfigDict()
-    cfg.data.train_dir = "/mnt/external_storage/torchvision_ImageFolder/train"
-    cfg.data.val_dir = "/mnt/external_storage/torchvision_ImageFolder/val"
+    cfg.data.train_dir = os.environ.get("IMAGENET_TRAIN_DIR", "/mnt/external_storage/torchvision_ImageFolder/train")
+    cfg.data.val_dir = os.environ.get("IMAGENET_VAL_DIR", "/mnt/external_storage/torchvision_ImageFolder/val")
     cfg.data.image_size = 64
     cfg.data.batch_size = 64  # Per GPU
     cfg.data.num_workers = 8
@@ -52,7 +53,7 @@ def get_config():
     cfg.fid.enabled = True
     cfg.fid.num_samples = 5000
     cfg.fid.batch_size = 512
-    cfg.fid.stats_file = "playground/fid_stats_classifier.json"
+    cfg.fid.stats_file = os.environ.get("FID_STATS_FILE", "fid_stats_classifier.json")
 
     cfg.wandb = ConfigDict()
     cfg.wandb.use = True
@@ -62,6 +63,6 @@ def get_config():
     cfg.wandb.dir = "."
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "playground/checkpoints_imagenet"
+    cfg.checkpoint.dir = os.path.join(os.environ.get("PLAYGROUND_CHECKPOINT_DIR", "checkpoints"), "imagenet")
 
     return cfg

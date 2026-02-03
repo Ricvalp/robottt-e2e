@@ -1,3 +1,4 @@
+import os
 from ml_collections import ConfigDict
 
 
@@ -9,7 +10,7 @@ def get_config():
     cfg.run.device = "cuda"
 
     cfg.data = ConfigDict()
-    cfg.data.root = "data"
+    cfg.data.root = os.environ.get("PLAYGROUND_DATA_ROOT", "data")
     cfg.data.download = True
     cfg.data.image_size = 32
     cfg.data.batch_size = 64
@@ -53,8 +54,9 @@ def get_config():
     cfg.fid.enabled = True
     cfg.fid.num_samples = 1000
     cfg.fid.batch_size = 512  # Larger batch for faster FID sample generation
-    cfg.fid.classifier_checkpoint = "playground/classifier_checkpoints/cifar100/cifar100_classifier.pt"
-    cfg.fid.stats_file = "playground/fid_stats_classifier.json"
+    cfg.fid.classifier_checkpoint = os.environ.get("CIFAR100_CLASSIFIER_CKPT", 
+        os.path.join(os.environ.get("PLAYGROUND_CHECKPOINT_DIR", "checkpoints"), "classifier_cifar100", "cifar100_classifier.pt"))
+    cfg.fid.stats_file = os.environ.get("FID_STATS_FILE", "fid_stats_classifier.json")
     cfg.fid.classifier_width = 64  # Must match trained classifier
     cfg.fid.classifier_num_blocks = 4  # Must match trained classifier
 
@@ -66,6 +68,6 @@ def get_config():
     cfg.wandb.dir = "."
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "playground/checkpoints_cifar100"
+    cfg.checkpoint.dir = os.path.join(os.environ.get("PLAYGROUND_CHECKPOINT_DIR", "checkpoints"), "cifar100")
 
     return cfg

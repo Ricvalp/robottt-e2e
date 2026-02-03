@@ -1,3 +1,4 @@
+import os
 from ml_collections import ConfigDict
 
 
@@ -9,7 +10,7 @@ def get_config():
     cfg.run.device = "cuda"
 
     cfg.data = ConfigDict()
-    cfg.data.root = "data"
+    cfg.data.root = os.environ.get("PLAYGROUND_DATA_ROOT", "data")
     cfg.data.download = True
     cfg.data.image_size = 32
     cfg.data.batch_size = 32            # inner-loop batch
@@ -66,9 +67,9 @@ def get_config():
     cfg.sample = ConfigDict()
     cfg.sample.num_images = 16
     cfg.sample.steps = 100
-    cfg.sample.dir = "outputs_cond_cifar100"
+    cfg.sample.dir = os.path.join(os.environ.get("PLAYGROUND_OUTPUT_DIR", "."), "outputs_cond_cifar100")
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "playground/checkpoints_cond_cifar100"
+    cfg.checkpoint.dir = os.path.join(os.environ.get("PLAYGROUND_CHECKPOINT_DIR", "checkpoints"), "cond_cifar100")
 
     return cfg

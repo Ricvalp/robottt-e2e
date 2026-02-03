@@ -1,3 +1,4 @@
+import os
 from ml_collections import ConfigDict
 
 
@@ -10,7 +11,7 @@ def get_config() -> ConfigDict:
     cfg.run.device = "cuda"  # or "cpu"
 
     cfg.data = ConfigDict()
-    cfg.data.root = "playground/data"
+    cfg.data.root = os.environ.get("PLAYGROUND_DATA_ROOT", "data")
     cfg.data.image_size = 32
     cfg.data.batch_size = 64
     cfg.data.num_workers = 4
@@ -57,22 +58,23 @@ def get_config() -> ConfigDict:
     cfg.sample = ConfigDict()
     cfg.sample.num_images = 16
     cfg.sample.steps = 100
-    cfg.sample.dir = "playground/maml_samples"
+    cfg.sample.dir = os.path.join(os.environ.get("PLAYGROUND_OUTPUT_DIR", "."), "maml_samples")
 
     cfg.counting = ConfigDict()
     cfg.counting.use = True
     cfg.counting.num_samples = 3000
     cfg.counting.batch_size = 256
-    cfg.counting.classifier_ckpt = "playground/classifier_checkpoints/mnist/classifier_epoch_010.pt"
+    cfg.counting.classifier_ckpt = os.environ.get("MNIST_CLASSIFIER_CKPT",
+        os.path.join(os.environ.get("PLAYGROUND_CHECKPOINT_DIR", "checkpoints"), "classifier_mnist", "classifier_epoch_010.pt"))
 
     cfg.fid = ConfigDict()
     cfg.fid.use = True
     cfg.fid.num_samples = 3000
     cfg.fid.batch_size = 256
-    cfg.fid.stats_path = "playground/fid_stats_classifier.json"
+    cfg.fid.stats_path = os.environ.get("FID_STATS_FILE", "fid_stats_classifier.json")
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "playground/maml_checkpoints"
+    cfg.checkpoint.dir = os.path.join(os.environ.get("PLAYGROUND_CHECKPOINT_DIR", "checkpoints"), "maml_mnist")
     cfg.checkpoint.resume = ""
 
     cfg.wandb = ConfigDict()

@@ -1,3 +1,4 @@
+import os
 from ml_collections import ConfigDict
 
 
@@ -9,7 +10,7 @@ def get_config() -> ConfigDict:
     cfg.run.device = "cuda"  # or "cpu"
 
     cfg.data = ConfigDict()
-    cfg.data.root = "playground/data"
+    cfg.data.root = os.environ.get("PLAYGROUND_DATA_ROOT", "data")
     cfg.data.image_size = 32
     cfg.data.batch_size = 256
     cfg.data.num_workers = 4
@@ -32,7 +33,7 @@ def get_config() -> ConfigDict:
     cfg.eval.batch_size = 512
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "playground/classifier_checkpoints/mnist"
+    cfg.checkpoint.dir = os.path.join(os.environ.get("PLAYGROUND_CHECKPOINT_DIR", "checkpoints"), "classifier_mnist")
     cfg.checkpoint.resume = ""
 
     cfg.wandb = ConfigDict()

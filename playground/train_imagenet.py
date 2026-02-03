@@ -64,7 +64,6 @@ def set_seed(seed: int, rank: int = 0) -> None:
         torch.cuda.manual_seed_all(seed + rank)
     torch.backends.cudnn.benchmark = True
 
-
 # -------------------------
 # Data
 # -------------------------

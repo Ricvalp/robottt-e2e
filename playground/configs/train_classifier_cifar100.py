@@ -1,3 +1,4 @@
+import os
 from ml_collections import ConfigDict
 
 
@@ -9,7 +10,7 @@ def get_config():
     cfg.run.device = "cuda"
 
     cfg.data = ConfigDict()
-    cfg.data.root = "data"
+    cfg.data.root = os.environ.get("PLAYGROUND_DATA_ROOT", "data")
     cfg.data.download = True
     cfg.data.image_size = 32
     cfg.data.batch_size = 128
@@ -41,6 +42,6 @@ def get_config():
     cfg.wandb.dir = "."
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "playground/classifier_checkpoints/cifar100"
+    cfg.checkpoint.dir = os.path.join(os.environ.get("PLAYGROUND_CHECKPOINT_DIR", "checkpoints"), "classifier_cifar100")
 
     return cfg
