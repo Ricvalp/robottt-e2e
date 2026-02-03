@@ -323,15 +323,22 @@ def train(cfg: ConfigDict) -> None:
             if dist.is_initialized():
                 dist.barrier()  # Sync all processes after sampling
 
-        # FID evaluation
+        # FID evaluation (rank 0 computes, others wait at barrier)
         if cfg.fid.enabled and epoch % cfg.training.fid_every_epochs == 0:
+            # First barrier: ensure all ranks are here before starting FID
+            if dist.is_initialized():
+                dist.barrier()
+
+            # Only rank 0 computes FID (other ranks skip but will wait at next barrier)
             fid_score = compute_fid_score(ddpm_module, cfg, device)
             if fid_score is not None:
                 print(f"  FID score: {fid_score:.2f}")
                 if wandb_run is not None:
                     wandb.log({"eval/fid": fid_score}, step=global_step)
+
+            # Second barrier: sync all ranks after FID computation
             if dist.is_initialized():
-                dist.barrier()  # Sync all processes after FID computation
+                dist.barrier()
 
         # Checkpoint (main process only)
         if is_main_process() and epoch % cfg.training.checkpoint_every_epochs == 0:
