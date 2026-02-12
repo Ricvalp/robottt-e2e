@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Task-Parallel MAML Training with vmap.
+Task-Parallel MAML Training with Channel Concatenation Conditioning.
 
-This script implements MAML with task parallelism using torch.func.vmap to reduce
-gradient variance by averaging outer gradients across multiple tasks per meta-step.
+This script implements MAML with task parallelism for a diffusion model that
+conditions by concatenating images along the channel dimension.
 
-Key differences from train_cond_maml_cifar100.py:
+Key features:
+- Channel concatenation conditioning (no FiLM, no cross-attention)
 - Samples N tasks (classes) per outer step instead of 1
-- Uses vmap to parallelize inner loop computation across tasks
 - Data shape: (N, B, C, H, W) for images, (N, K, C, H, W) for conditioning
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ from torchvision import datasets, transforms, utils
 import wandb
 from tqdm import tqdm
 
-from playground.models.conditional_model import ConditionalUNet, DDPM, ResBlockCond
+from playground.models.conditional_model_concat import ConcatConditionalUNet, DDPM, ResBlock
 
 
 # -------------------------
@@ -213,20 +213,18 @@ def sample_multi_task_batches(
     return imgs_x, imgs_cond, sampled_classes
 
 
-def select_fast_params(model: ConditionalUNet, selector: str) -> Tuple[List[str], List[nn.Parameter]]:
+def select_fast_params(model: ConcatConditionalUNet, selector: str) -> Tuple[List[str], List[nn.Parameter]]:
     """
     Select which parameters are 'fast' (updated in inner loop).
+    
+    Note: This model has no FiLM/cond_mlp, so we adapt time_mlp, norms, and convs.
     """
     fast_params: List[nn.Parameter] = []
     fast_names: List[str] = []
 
-    def add_mlp(name, module):
+    def add_time_mlp(name, module):
         for pname, p in module.time_mlp.named_parameters():
             full = f"{name}.time_mlp.{pname}"
-            fast_names.append(full)
-            fast_params.append(p)
-        for pname, p in module.cond_mlp.named_parameters():
-            full = f"{name}.cond_mlp.{pname}"
             fast_names.append(full)
             fast_params.append(p)
 
@@ -236,7 +234,7 @@ def select_fast_params(model: ConditionalUNet, selector: str) -> Tuple[List[str]
             fast_names.append(full)
             fast_params.append(p)
 
-    def add_convs(name, module: ResBlockCond):
+    def add_convs(name, module: ResBlock):
         for pname, p in module.conv1.named_parameters():
             full = f"{name}.conv1.{pname}"
             fast_names.append(full)
@@ -291,12 +289,12 @@ def select_fast_params(model: ConditionalUNet, selector: str) -> Tuple[List[str]
         raise ValueError(f"Unknown selector {selector}")
 
     for name, module in model.named_modules():
-        if isinstance(module, ResBlockCond):
+        if isinstance(module, ResBlock):
             is_up = name.startswith("ups")
             is_down = name.startswith("downs")
             is_mid = name.startswith("mid")
             if (is_up and "ups" in targets) or (is_down and "downs" in targets) or (include_mid and is_mid):
-                add_mlp(name, module)
+                add_time_mlp(name, module)
                 if include_gn:
                     add_gn(f"{name}.norm1", module.norm1)
                     add_gn(f"{name}.norm2", module.norm2)
@@ -324,77 +322,6 @@ def count_params(all_params, fast_names: List[str], base_params: Dict[str, torch
     return total, fast
 
 
-def _load_state_dict_with_report(
-    module: nn.Module,
-    state_dict: Dict[str, torch.Tensor],
-    strict: bool,
-    label: str,
-) -> bool:
-    """Load state dict and print missing/unexpected keys; return success flag."""
-    module_keys = set(module.state_dict().keys())
-    provided_keys = set(state_dict.keys())
-    key_overlap = module_keys.intersection(provided_keys)
-    if len(key_overlap) == 0:
-        print(f"{label}: no matching parameter keys, skipping this load path.")
-        return False
-
-    try:
-        load_result = module.load_state_dict(state_dict, strict=strict)
-    except RuntimeError as exc:
-        print(f"Failed loading {label}: {exc}")
-        return False
-
-    if hasattr(load_result, "missing_keys") and hasattr(load_result, "unexpected_keys"):
-        if len(load_result.missing_keys) > 0:
-            print(f"{label}: missing keys ({len(load_result.missing_keys)}), e.g. {load_result.missing_keys[:5]}")
-        if len(load_result.unexpected_keys) > 0:
-            print(f"{label}: unexpected keys ({len(load_result.unexpected_keys)}), e.g. {load_result.unexpected_keys[:5]}")
-    return True
-
-
-def load_pretrained_if_available(ddpm: DDPM, cfg: ConfigDict, device: torch.device) -> None:
-    """
-    Optionally load pretrained weights before MAML meta-training.
-
-    Supports checkpoints that contain:
-    - {"unet": ...} from pretrain_cifar100.py
-    - {"model": ...} either DDPM state or UNet state
-    - raw state_dict
-    """
-    pretrained_cfg = getattr(cfg, "pretrained", None)
-    if pretrained_cfg is None or not bool(getattr(pretrained_cfg, "use", False)):
-        return
-
-    ckpt_path = Path(str(getattr(pretrained_cfg, "checkpoint", "")).strip())
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Pretrained checkpoint not found: {ckpt_path}")
-
-    strict = bool(getattr(pretrained_cfg, "strict", False))
-    print(f"Loading pretrained checkpoint from {ckpt_path} (strict={strict})")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-
-    loaded = False
-    if isinstance(ckpt, dict):
-        if "unet" in ckpt:
-            loaded = _load_state_dict_with_report(ddpm.model, ckpt["unet"], strict, "pretrained/unet")
-        if not loaded and "model" in ckpt:
-            state = ckpt["model"]
-            # First try as full DDPM state, then as UNet-only state.
-            loaded = _load_state_dict_with_report(ddpm, state, strict, "pretrained/model_as_ddpm")
-            if not loaded:
-                loaded = _load_state_dict_with_report(ddpm.model, state, strict, "pretrained/model_as_unet")
-        if not loaded and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
-            loaded = _load_state_dict_with_report(ddpm.model, ckpt, strict, "pretrained/raw_unet")
-            if not loaded:
-                loaded = _load_state_dict_with_report(ddpm, ckpt, strict, "pretrained/raw_ddpm")
-    else:
-        print(f"Unsupported checkpoint format type: {type(ckpt)}")
-
-    if not loaded:
-        raise RuntimeError(f"Could not load pretrained weights from {ckpt_path}")
-    print("Pretrained weights loaded successfully.")
-
-
 # -------------------------
 # Functional helpers for vmap
 # -------------------------
@@ -402,7 +329,7 @@ def load_pretrained_if_available(ddpm: DDPM, cfg: ConfigDict, device: torch.devi
 
 def compute_loss_functional(
     params: Dict[str, torch.Tensor],
-    model: ConditionalUNet,
+    model: ConcatConditionalUNet,
     x0: torch.Tensor,
     t: torch.Tensor,
     cond: torch.Tensor,
@@ -414,7 +341,7 @@ def compute_loss_functional(
     
     Args:
         params: parameter dict for functional_call
-        model: the ConditionalUNet (structure only, params from dict)
+        model: the ConcatConditionalUNet (structure only, params from dict)
         x0: clean images (B, C, H, W)
         t: timesteps (B,)
         cond: conditioning images (K, C, H, W)
@@ -446,7 +373,7 @@ def compute_loss_functional(
 def inner_loop_step(
     params: Dict[str, torch.Tensor],
     fast_names: List[str],
-    model: ConditionalUNet,
+    model: ConcatConditionalUNet,
     imgs: torch.Tensor,
     cond: torch.Tensor,
     inner_lr: float,
@@ -498,7 +425,7 @@ def inner_loop_step(
 def single_task_maml_loss(
     params: Dict[str, torch.Tensor],
     fast_names: List[str],
-    model: ConditionalUNet,
+    model: ConcatConditionalUNet,
     imgs: torch.Tensor,
     cond: torch.Tensor,
     inner_lr: float,
@@ -591,7 +518,7 @@ def multi_task_maml_step(
 
 
 # -------------------------
-# Adaptation and sampling (unchanged from original)
+# Adaptation and sampling
 # -------------------------
 
 
@@ -632,7 +559,7 @@ def adapt_and_sample(
     with torch.no_grad():
         img = torch.randn(
             cfg.sample.num_images,
-            ddpm.model.in_conv.in_channels,
+            ddpm.model.in_channels,
             cfg.data.image_size,
             cfg.data.image_size,
             device=device,
@@ -679,18 +606,16 @@ def train(cfg: ConfigDict) -> None:
 
     dataset, train_indices_by_class, val_indices_by_class, train_classes, eval_classes = build_datasets(cfg)
 
-    model = ConditionalUNet(
+    model = ConcatConditionalUNet(
         in_channels=cfg.model.in_channels,
         base_channels=cfg.model.base_channels,
         channel_mults=tuple(cfg.model.channel_mults),
         num_res_blocks=cfg.model.num_res_blocks,
         dropout=cfg.model.dropout,
         attn_resolutions=tuple(cfg.model.attn_resolutions),
-        cross_attn_resolutions=tuple(cfg.model.cross_attn_resolutions),
         num_heads=cfg.model.num_heads,
         image_size=cfg.data.image_size,
         time_scale=1000.0,
-        cond_dim=cfg.model.cond_dim,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params / 1e6:.2f}M ({n_params})")
@@ -700,7 +625,6 @@ def train(cfg: ConfigDict) -> None:
         log_snr_max=cfg.diffusion.log_snr_max,
         log_snr_min=cfg.diffusion.log_snr_min,
     ).to(device)
-    load_pretrained_if_available(ddpm, cfg, device)
 
     fast_names, fast_params = select_fast_params(model, cfg.fast_params.selector)
     base_params = build_param_dict(ddpm.model)
@@ -816,7 +740,7 @@ def train(cfg: ConfigDict) -> None:
 
         # Checkpointing
         if epoch % cfg.training.checkpoint_every_epochs == 0:
-            ckpt_path = run_save_dir / f"cond_maml_vmap_epoch_{epoch:03d}.pt"
+            ckpt_path = run_save_dir / f"cond_maml_concat_epoch_{epoch:03d}.pt"
             torch.save(
                 {
                     "epoch": epoch,
@@ -839,7 +763,7 @@ def train(cfg: ConfigDict) -> None:
 
 _CONFIG = config_flags.DEFINE_config_file(
     "config",
-    default="playground/configs/train_cond_maml_cifar100_vmap.py",
+    default="playground/configs/train_cond_maml_cifar100_concat.py",
     help_string="Path to a ml_collections config file.",
 )
 

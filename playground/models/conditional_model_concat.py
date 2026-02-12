@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 """
-Conditional U-Net for DDPM with:
-- FiLM modulation in ResBlocks driven by exemplar images
-- Optional cross-attention that lets spatial features attend to exemplar tokens
+Conditional U-Net for DDPM with channel concatenation conditioning.
 
-Interface mirrors playground/model.py but adds `cond` argument to forward:
+Instead of using FiLM modulation or cross-attention, this model conditions
+by simply concatenating the exemplar images along the channel dimension.
+
+Interface mirrors conditional_model.py but conditioning is via channel concat:
     cond: exemplar images tensor of shape (B, K, C, H, W) or (B, C, H, W)
+          These are averaged over K and concatenated to the noisy input.
 """
 
 import math
@@ -38,15 +40,14 @@ def sinusoidal_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
 # Building blocks
 # -------------------------
 
-class ResBlockCond(nn.Module):
-    """ResBlock with FiLM conditioning."""
+class ResBlock(nn.Module):
+    """Standard ResBlock with time conditioning only (no FiLM)."""
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
         time_emb_dim: int,
-        cond_dim: int,
         dropout: float,
     ) -> None:
         super().__init__()
@@ -56,12 +57,6 @@ class ResBlockCond(nn.Module):
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_emb_dim, out_channels),
-        )
-
-        # FiLM from conditioning vector
-        self.cond_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(cond_dim, out_channels * 2),  # gamma and beta
         )
 
         self.norm2 = nn.GroupNorm(32, out_channels)
@@ -74,14 +69,10 @@ class ResBlockCond(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         h = self.conv1(F.silu(self.norm1(x)))
         h = h + self.time_mlp(t_emb)[:, :, None, None]
-
-        # FiLM modulation
-        gamma, beta = self.cond_mlp(cond).chunk(2, dim=1)
         h = self.norm2(h)
-        h = h * (1 + gamma[:, :, None, None]) + beta[:, :, None, None]
         h = self.conv2(self.dropout(F.silu(h)))
         return h + self.skip(x)
 
@@ -98,47 +89,6 @@ class SelfAttention(nn.Module):
         y, _ = self.attn(y, y, y)
         y = y.transpose(1, 2).view(b, c, h, w)
         return x + y
-
-
-class CrossAttention(nn.Module):
-    """Cross-attend UNet features (queries) to exemplar tokens (keys/values)."""
-
-    def __init__(self, channels: int, cond_dim: int, num_heads: int) -> None:
-        super().__init__()
-        self.norm_x = nn.GroupNorm(32, channels)
-        self.q_proj = nn.Linear(channels, channels, bias=False)
-        self.k_proj = nn.Linear(cond_dim, channels, bias=False)
-        self.v_proj = nn.Linear(cond_dim, channels, bias=False)
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        assert channels % num_heads == 0, "channels must be divisible by num_heads"
-
-        self.out = nn.Linear(channels, channels)
-
-    def forward(self, x: torch.Tensor, cond_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, H, W)
-        cond_tokens: (B, S, cond_dim)  exemplar tokens
-        """
-        b, c, h, w = x.shape
-        x_norm = self.norm_x(x).view(b, c, h * w).transpose(1, 2)  # (B, HW, C)
-
-        q = self.q_proj(x_norm)  # (B, HW, C)
-        k = self.k_proj(cond_tokens)  # (B, S, C)
-        v = self.v_proj(cond_tokens)  # (B, S, C)
-
-        def reshape_heads(t):
-            return t.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2)
-
-        q, k, v = map(reshape_heads, (q, k, v))  # (B, heads, seq, dim)
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, heads, HW, S)
-        attn = attn_scores.softmax(dim=-1)
-        out = torch.matmul(attn, v)  # (B, heads, HW, dim)
-
-        out = out.transpose(1, 2).contiguous().view(b, h * w, c)
-        out = self.out(out)
-        out = out.transpose(1, 2).view(b, c, h, w)
-        return x + out
 
 
 class Downsample(nn.Module):
@@ -161,49 +111,15 @@ class Upsample(nn.Module):
 
 
 # -------------------------
-# Conditioning encoder
+# Conditional UNet with Channel Concatenation
 # -------------------------
 
-class ExemplarEncoder(nn.Module):
-    """Tiny CNN encoder to turn exemplar images into a single conditioning vector."""
-
-    def __init__(self, in_channels: int, hidden: int, cond_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, hidden, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden, hidden, 3, padding=1, stride=2),
-            nn.SiLU(),
-            nn.Conv2d(hidden, hidden, 3, padding=1, stride=2),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1),
-        )
-        self.proj = nn.Linear(hidden, cond_dim)
-
-    def forward(self, exemplars: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        exemplars: (B, K, C, H, W) or (B, C, H, W)
-        Returns:
-            cond_vec: (B, cond_dim)
-            tokens: (B, K, cond_dim)  per-exemplar tokens for cross-attn
-        """
-        if exemplars.dim() == 4:  # (B, C, H, W) -> add K=1
-            exemplars = exemplars.unsqueeze(1)
-        b, k, c, h, w = exemplars.shape
-        flat = exemplars.view(b * k, c, h, w)
-        feats = self.net(flat).view(b * k, -1)  # (B*K, hidden)
-        tokens = self.proj(feats).view(b, k, -1)  # (B, K, cond_dim)
-        cond_vec = tokens.mean(dim=1)
-        return cond_vec, tokens
-
-
-# -------------------------
-# Conditional UNet
-# -------------------------
-
-class ConditionalUNet(nn.Module):
+class ConcatConditionalUNet(nn.Module):
     """
-    UNet with FiLM conditioning and optional cross-attention to exemplar tokens.
+    UNet with channel concatenation conditioning.
+    
+    The conditioning image(s) are averaged (if multiple) and concatenated
+    to the noisy input along the channel dimension.
     """
 
     def __init__(
@@ -214,17 +130,15 @@ class ConditionalUNet(nn.Module):
         num_res_blocks: int = 2,
         dropout: float = 0.1,
         attn_resolutions: Iterable[int] = (16,),
-        cross_attn_resolutions: Iterable[int] = (32,),  # apply cross-attn at highest res by default
         num_heads: int = 4,
         image_size: int = 32,
         time_scale: float = 1000.0,
-        cond_dim: int = 256,
     ) -> None:
         super().__init__()
         self.image_size = image_size
         self.time_scale = time_scale
+        self.in_channels = in_channels
         time_dim = base_channels * 4
-        self.cond_dim = cond_dim
 
         self.time_mlp = nn.Sequential(
             nn.Linear(base_channels, time_dim),
@@ -232,9 +146,8 @@ class ConditionalUNet(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
 
-        self.cond_encoder = ExemplarEncoder(in_channels, hidden=base_channels, cond_dim=cond_dim)
-
-        self.in_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+        # Input conv: takes noisy image + conditioning image (2x channels)
+        self.in_conv = nn.Conv2d(in_channels * 2, base_channels, 3, padding=1)
 
         downs = []
         skip_channels = []
@@ -243,14 +156,12 @@ class ConditionalUNet(nn.Module):
         for mult_idx, mult in enumerate(channel_mults):
             out_ch = base_channels * mult
             for _ in range(num_res_blocks):
-                block = ResBlockCond(in_ch, out_ch, time_dim, cond_dim, dropout)
+                block = ResBlock(in_ch, out_ch, time_dim, dropout)
                 downs.append(block)
                 in_ch = out_ch
                 skip_channels.append(in_ch)
                 if curr_res in attn_resolutions:
                     downs.append(SelfAttention(in_ch, num_heads))
-                if curr_res in cross_attn_resolutions:
-                    downs.append(CrossAttention(in_ch, cond_dim, num_heads))
             if mult_idx != len(channel_mults) - 1:
                 downs.append(Downsample(in_ch))
                 curr_res //= 2
@@ -259,9 +170,9 @@ class ConditionalUNet(nn.Module):
 
         self.mid = nn.ModuleList(
             [
-                ResBlockCond(in_ch, in_ch, time_dim, cond_dim, dropout),
+                ResBlock(in_ch, in_ch, time_dim, dropout),
                 SelfAttention(in_ch, num_heads),
-                ResBlockCond(in_ch, in_ch, time_dim, cond_dim, dropout),
+                ResBlock(in_ch, in_ch, time_dim, dropout),
             ]
         )
 
@@ -273,13 +184,11 @@ class ConditionalUNet(nn.Module):
                 curr_res *= 2
             elif isinstance(layer, SelfAttention):
                 ups.append(SelfAttention(in_ch, num_heads))
-            elif isinstance(layer, CrossAttention):
-                ups.append(CrossAttention(in_ch, cond_dim, num_heads))
-            elif isinstance(layer, ResBlockCond):
+            elif isinstance(layer, ResBlock):
                 if not skip_stack:
                     raise RuntimeError("Skip channel stack empty when building up path.")
                 skip_ch = skip_stack.pop()
-                ups.append(ResBlockCond(in_ch + skip_ch, skip_ch, time_dim, cond_dim, dropout))
+                ups.append(ResBlock(in_ch + skip_ch, skip_ch, time_dim, dropout))
                 in_ch = skip_ch
             else:
                 raise TypeError(f"Unexpected layer type in downs: {type(layer)}")
@@ -290,57 +199,69 @@ class ConditionalUNet(nn.Module):
 
     def forward(self, x: torch.Tensor, timesteps: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        cond: exemplar images (B, K, C, H, W) or (B, C, H, W); if None, zeros are used.
+        Forward pass with channel concatenation conditioning.
+        
+        Args:
+            x: noisy images (B, C, H, W)
+            timesteps: diffusion timesteps (B,)
+            cond: exemplar images (B, K, C, H, W) or (B, C, H, W) or (K, C, H, W)
+                  If None, zeros are used as neutral conditioning.
         """
+        B = x.shape[0]
+        
         if cond is None:
-            # use zeros as neutral conditioning
-            cond_vec = x.new_zeros(x.shape[0], self.cond_dim)
-            cond_tokens = cond_vec.unsqueeze(1)
+            # Use zeros as neutral conditioning
+            cond_img = torch.zeros_like(x)
         else:
-            cond_vec, cond_tokens = self.cond_encoder(cond)
-            if cond_vec.shape[0] == x.shape[0]:
-                # Per-sample conditioning: one exemplar set per x sample.
-                pass
-            elif cond_vec.shape[0] == 1:
-                # Task-level conditioning: share one exemplar set across the full batch.
-                cond_vec = cond_vec.repeat(x.shape[0], 1)
-                cond_tokens = cond_tokens.repeat(x.shape[0], 1, 1)
+            # Handle different conditioning shapes
+            if cond.dim() == 4:
+                # (B, C, H, W) or (K, C, H, W)
+                if cond.shape[0] == B:
+                    # (B, C, H, W) - one cond per sample
+                    cond_img = cond
+                else:
+                    # (K, C, H, W) - K exemplars, broadcast to batch
+                    cond_img = cond.mean(dim=0, keepdim=True).expand(B, -1, -1, -1)
+            elif cond.dim() == 5:
+                # (B, K, C, H, W) or (1, K, C, H, W)
+                if cond.shape[0] == B:
+                    # (B, K, C, H, W) - average over K exemplars
+                    cond_img = cond.mean(dim=1)
+                else:
+                    # (1, K, C, H, W) - average and broadcast
+                    cond_img = cond.mean(dim=1).expand(B, -1, -1, -1)
             else:
-                raise ValueError(
-                    f"Conditioning batch ({cond_vec.shape[0]}) must match x batch ({x.shape[0]}) "
-                    "or be 1 for shared conditioning."
-                )
+                raise ValueError(f"Unexpected cond shape: {cond.shape}")
+
+        # Concatenate noisy image and conditioning image along channel dimension
+        x_concat = torch.cat([x, cond_img], dim=1)  # (B, 2*C, H, W)
 
         t_emb = self.time_mlp(sinusoidal_embedding(timesteps * self.time_scale, self.time_mlp[0].in_features))
 
         hs = []
-        h = self.in_conv(x)
+        h = self.in_conv(x_concat)
         for layer in self.downs:
-            if isinstance(layer, ResBlockCond):
-                h = layer(h, t_emb, cond_vec)
+            if isinstance(layer, ResBlock):
+                h = layer(h, t_emb)
                 hs.append(h)
             elif isinstance(layer, SelfAttention):
                 h = layer(h)
-            elif isinstance(layer, CrossAttention):
-                h = layer(h, cond_tokens)
             else:
                 h = layer(h)
 
         for layer in self.mid:
-            if isinstance(layer, ResBlockCond):
-                h = layer(h, t_emb, cond_vec)
+            if isinstance(layer, ResBlock):
+                h = layer(h, t_emb)
             else:
                 h = layer(h)
 
         for layer in self.ups:
-            if isinstance(layer, ResBlockCond):
+            if isinstance(layer, ResBlock):
                 skip = hs.pop()
                 h = torch.cat([h, skip], dim=1)
-                h = layer(h, t_emb, cond_vec)
+                h = layer(h, t_emb)
             elif isinstance(layer, SelfAttention):
                 h = layer(h)
-            elif isinstance(layer, CrossAttention):
-                h = layer(h, cond_tokens)
             else:
                 h = layer(h)
 
@@ -349,7 +270,7 @@ class ConditionalUNet(nn.Module):
 
 
 # -------------------------
-# DDPM wrapper (unchanged except for cond threading)
+# DDPM wrapper
 # -------------------------
 
 class DDPM(nn.Module):
@@ -360,7 +281,7 @@ class DDPM(nn.Module):
 
     def __init__(
         self,
-        model: ConditionalUNet,
+        model: ConcatConditionalUNet,
         log_snr_max: float = 5.0,
         log_snr_min: float = -15.0,
     ) -> None:
