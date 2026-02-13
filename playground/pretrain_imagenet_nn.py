@@ -247,13 +247,28 @@ def log_samples(
 
     gen_vis = (samples.clamp(-1, 1) + 1) / 2
     query_vis = (x[:n].clamp(-1, 1) + 1) / 2
-    cond_vis = (cond[:n, 0].clamp(-1, 1) + 1) / 2
+    # Show first 4 conditioning exemplars per query as an (N rows x 4 cols) grid.
+    n_cond_show = 4
+    cond_show = cond[:n, : min(n_cond_show, cond.shape[1])]
+    if cond_show.shape[1] < n_cond_show:
+        pad = -torch.ones(
+            n,
+            n_cond_show - cond_show.shape[1],
+            cond_show.shape[2],
+            cond_show.shape[3],
+            cond_show.shape[4],
+            device=cond_show.device,
+            dtype=cond_show.dtype,
+        )
+        cond_show = torch.cat([cond_show, pad], dim=1)
+    cond_vis = (cond_show.clamp(-1, 1) + 1) / 2
+    cond_vis = cond_vis.reshape(n * n_cond_show, cond_vis.shape[2], cond_vis.shape[3], cond_vis.shape[4])
 
     nrow = _grid_nrow(n)
     logs: Dict[str, object] = {
         "samples/generated": wandb.Image(utils.make_grid(gen_vis, nrow=nrow)),
         "samples/query_target": wandb.Image(utils.make_grid(query_vis, nrow=nrow)),
-        "samples/conditioning_first": wandb.Image(utils.make_grid(cond_vis, nrow=nrow)),
+        "samples/conditioning_first4": wandb.Image(utils.make_grid(cond_vis, nrow=n_cond_show)),
     }
     agreement = compute_neighbor_label_agreement(meta)
     if agreement is not None:
