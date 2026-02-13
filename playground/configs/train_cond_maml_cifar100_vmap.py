@@ -66,7 +66,7 @@ def get_config():
 
     cfg.pretrained = ConfigDict()
     cfg.pretrained.use = False
-    cfg.pretrained.strict = False
+    cfg.pretrained.strict = True # False
     cfg.pretrained.checkpoint = os.environ.get(
         "CIFAR100_PRETRAIN_CKPT",
         os.path.join(

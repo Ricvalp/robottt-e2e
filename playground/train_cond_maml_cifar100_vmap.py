@@ -45,6 +45,7 @@ def adapt_and_log_denoise(
     device: torch.device,
     wandb_run,
     global_step: int,
+    inner_steps: int,
     max_imgs: int = 8,
 ):
     """Adapt to task and log noised images with predicted x0 for debugging."""
@@ -64,7 +65,7 @@ def adapt_and_log_denoise(
         return torch.mean((v_pred - v_target) ** 2)
 
     # Adapt parameters
-    for _ in range(cfg.eval.inner_steps):
+    for _ in range(inner_steps):
         t = torch.rand(imgs.shape[0], device=device)
         loss = p_losses_with_params(params, imgs, t, cond_imgs.unsqueeze(0))
         grads = torch.autograd.grad(loss, [params[n] for n in fast_names], create_graph=False)
@@ -352,7 +353,7 @@ def _load_state_dict_with_report(
     return True
 
 
-def load_pretrained_if_available(ddpm: DDPM, cfg: ConfigDict, device: torch.device) -> None:
+def load_pretrained_if_available(ddpm: DDPM, cfg: ConfigDict, device: torch.device) -> bool:
     """
     Optionally load pretrained weights before MAML meta-training.
 
@@ -363,7 +364,7 @@ def load_pretrained_if_available(ddpm: DDPM, cfg: ConfigDict, device: torch.devi
     """
     pretrained_cfg = getattr(cfg, "pretrained", None)
     if pretrained_cfg is None or not bool(getattr(pretrained_cfg, "use", False)):
-        return
+        return False
 
     ckpt_path = Path(str(getattr(pretrained_cfg, "checkpoint", "")).strip())
     if not ckpt_path.exists():
@@ -393,6 +394,7 @@ def load_pretrained_if_available(ddpm: DDPM, cfg: ConfigDict, device: torch.devi
     if not loaded:
         raise RuntimeError(f"Could not load pretrained weights from {ckpt_path}")
     print("Pretrained weights loaded successfully.")
+    return True
 
 
 # -------------------------
@@ -603,6 +605,7 @@ def adapt_and_sample(
     cond_imgs: torch.Tensor,
     cfg: ConfigDict,
     device: torch.device,
+    inner_steps: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Adapt to a task and sample images."""
     params = base_params
@@ -617,7 +620,7 @@ def adapt_and_sample(
         v_pred = functional_call(ddpm.model, params_dict, (x_t, t, cond))
         return torch.mean((v_pred - v_target) ** 2)
 
-    for _ in range(cfg.eval.inner_steps):
+    for _ in range(inner_steps):
         t = torch.rand(imgs.shape[0], device=device)
         loss = p_losses_with_params(params, imgs, t, cond_imgs.unsqueeze(0))
         grads = torch.autograd.grad(loss, [params[n] for n in fast_names], create_graph=False)
@@ -666,6 +669,85 @@ def adapt_and_sample(
     return grid, target_grid
 
 
+def log_adaptation_samples(
+    ddpm: DDPM,
+    dataset,
+    train_indices_by_class,
+    val_indices_by_class,
+    train_classes: List[int],
+    eval_classes: List[int],
+    fast_names: List[str],
+    base_params: Dict[str, torch.Tensor],
+    cfg: ConfigDict,
+    device: torch.device,
+    wandb_run,
+    global_step: int,
+    inner_steps: int,
+    key_prefix: str = "",
+) -> None:
+    """
+    Log adaptation samples exactly as done during training evaluation.
+    `key_prefix` can be used for special one-off logs (e.g., pretrained sanity check).
+    """
+    if wandb_run is None:
+        return
+
+    eval_pool = eval_classes if len(eval_classes) > 0 else train_classes
+    train_pool = train_classes if len(train_classes) > 0 else eval_classes
+    if len(eval_pool) == 0:
+        print("Warning: no classes available for adaptation logging.")
+        return
+
+    def k(name: str) -> str:
+        return f"{key_prefix}{name}" if key_prefix else name
+
+    ddpm.eval()
+
+    cls = random.choice(eval_pool)
+    val_imgs = sample_class_batch(dataset, val_indices_by_class, cls, cfg.data.batch_size, device)
+    val_cond = sample_class_batch(dataset, val_indices_by_class, cls, cfg.data.cond_batch_size, device)
+    grid, target_grid = adapt_and_sample(
+        ddpm, fast_names, base_params, val_imgs, val_cond, cfg, device, inner_steps=inner_steps
+    )
+    wandb.log(
+        {
+            k("samples"): wandb.Image(grid),
+            k("target_samples"): wandb.Image(target_grid),
+            k("eval_class"): cls,
+        },
+        step=global_step,
+    )
+    adapt_and_log_denoise(
+        ddpm,
+        val_imgs,
+        val_cond,
+        fast_names,
+        base_params,
+        cfg,
+        device,
+        wandb_run,
+        global_step,
+        inner_steps=inner_steps,
+    )
+
+    if len(train_pool) == 0:
+        return
+    train_cls = random.choice(train_pool)
+    tr_imgs = sample_class_batch(dataset, train_indices_by_class, train_cls, cfg.data.batch_size, device)
+    tr_cond = sample_class_batch(dataset, train_indices_by_class, train_cls, cfg.data.cond_batch_size, device)
+    train_grid, train_target_grid = adapt_and_sample(
+        ddpm, fast_names, base_params, tr_imgs, tr_cond, cfg, device, inner_steps=inner_steps
+    )
+    wandb.log(
+        {
+            k("train_adapt/samples"): wandb.Image(train_grid),
+            k("train_adapt/target_samples"): wandb.Image(train_target_grid),
+            k("train_adapt/class"): train_cls,
+        },
+        step=global_step,
+    )
+
+
 # -------------------------
 # Training loop
 # -------------------------
@@ -700,7 +782,7 @@ def train(cfg: ConfigDict) -> None:
         log_snr_max=cfg.diffusion.log_snr_max,
         log_snr_min=cfg.diffusion.log_snr_min,
     ).to(device)
-    load_pretrained_if_available(ddpm, cfg, device)
+    pretrained_loaded = load_pretrained_if_available(ddpm, cfg, device)
 
     fast_names, fast_params = select_fast_params(model, cfg.fast_params.selector)
     base_params = build_param_dict(ddpm.model)
@@ -729,6 +811,25 @@ def train(cfg: ConfigDict) -> None:
     run_save_dir.mkdir(parents=True, exist_ok=True)
 
     global_step = 0
+    if pretrained_loaded and wandb_run is not None:
+        print("Logging pretrained sanity-check samples before meta-training...")
+        log_adaptation_samples(
+            ddpm,
+            dataset,
+            train_indices_by_class,
+            val_indices_by_class,
+            train_classes,
+            eval_classes,
+            fast_names,
+            base_params,
+            cfg,
+            device,
+            wandb_run,
+            global_step=global_step,
+            inner_steps=0,
+            key_prefix="pretrained_check/",
+        )
+
     for epoch in range(1, cfg.training.epochs + 1):
         ddpm.train()
         pbar = tqdm(range(cfg.training.steps_per_epoch), desc=f"Epoch {epoch}", leave=False)
@@ -774,45 +875,21 @@ def train(cfg: ConfigDict) -> None:
 
         # Evaluation sampling
         if epoch % cfg.training.sample_every_epochs == 0:
-            ddpm.eval()
-            cls = random.choice(eval_classes)
-            val_imgs = sample_class_batch(
-                dataset, val_indices_by_class, cls, cfg.data.batch_size, device
+            log_adaptation_samples(
+                ddpm,
+                dataset,
+                train_indices_by_class,
+                val_indices_by_class,
+                train_classes,
+                eval_classes,
+                fast_names,
+                base_params,
+                cfg,
+                device,
+                wandb_run,
+                global_step=global_step,
+                inner_steps=cfg.eval.inner_steps,
             )
-            val_cond = sample_class_batch(
-                dataset, val_indices_by_class, cls, cfg.data.cond_batch_size, device
-            )
-            grid, target_grid = adapt_and_sample(
-                ddpm, fast_names, base_params, val_imgs, val_cond, cfg, device
-            )
-            if wandb_run is not None:
-                wandb.log(
-                    {"samples": wandb.Image(grid), "target_samples": wandb.Image(target_grid), "eval_class": cls},
-                    step=global_step,
-                )
-                # Use one task for debug logging
-                adapt_and_log_denoise(ddpm, imgs_all[0], cond_all[0], fast_names, base_params, cfg, device, wandb_run, global_step)
-
-            # Also log adaptation on a training class
-            train_cls = random.choice(train_classes)
-            tr_imgs = sample_class_batch(
-                dataset, train_indices_by_class, train_cls, cfg.data.batch_size, device
-            )
-            tr_cond = sample_class_batch(
-                dataset, train_indices_by_class, train_cls, cfg.data.cond_batch_size, device
-            )
-            train_grid, train_target_grid = adapt_and_sample(
-                ddpm, fast_names, base_params, tr_imgs, tr_cond, cfg, device
-            )
-            if wandb_run is not None:
-                wandb.log(
-                    {
-                        "train_adapt/samples": wandb.Image(train_grid),
-                        "train_adapt/target_samples": wandb.Image(train_target_grid),
-                        "train_adapt/class": train_cls,
-                    },
-                    step=global_step,
-                )
 
         # Checkpointing
         if epoch % cfg.training.checkpoint_every_epochs == 0:
