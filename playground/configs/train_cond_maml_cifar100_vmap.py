@@ -35,6 +35,7 @@ def get_config():
     cfg.diffusion = ConfigDict()
     cfg.diffusion.log_snr_max = 5.0
     cfg.diffusion.log_snr_min = -15.0
+    cfg.diffusion.p_uncond = 0.1
 
     cfg.training = ConfigDict()
     cfg.training.epochs = 500

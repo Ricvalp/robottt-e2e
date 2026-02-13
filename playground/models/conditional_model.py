@@ -233,6 +233,11 @@ class ConditionalUNet(nn.Module):
         )
 
         self.cond_encoder = ExemplarEncoder(in_channels, hidden=base_channels, cond_dim=cond_dim)
+        # Learnable null conditioning for classifier-free guidance.
+        self.null_cond_vec = nn.Parameter(torch.zeros(cond_dim))
+        self.null_cond_tokens = nn.Parameter(torch.zeros(1, cond_dim))
+        nn.init.normal_(self.null_cond_vec, mean=0.0, std=0.02)
+        nn.init.normal_(self.null_cond_tokens, mean=0.0, std=0.02)
 
         self.in_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
 
@@ -290,12 +295,12 @@ class ConditionalUNet(nn.Module):
 
     def forward(self, x: torch.Tensor, timesteps: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        cond: exemplar images (B, K, C, H, W) or (B, C, H, W); if None, zeros are used.
+        cond: exemplar images (B, K, C, H, W) or (B, C, H, W); if None, learnable
+        null conditioning is used.
         """
         if cond is None:
-            # use zeros as neutral conditioning
-            cond_vec = x.new_zeros(x.shape[0], self.cond_dim)
-            cond_tokens = cond_vec.unsqueeze(1)
+            cond_vec = self.null_cond_vec.unsqueeze(0).expand(x.shape[0], -1)
+            cond_tokens = self.null_cond_tokens.unsqueeze(0).expand(x.shape[0], -1, -1)
         else:
             cond_vec, cond_tokens = self.cond_encoder(cond)
             if cond_vec.shape[0] == x.shape[0]:
@@ -363,11 +368,13 @@ class DDPM(nn.Module):
         model: ConditionalUNet,
         log_snr_max: float = 5.0,
         log_snr_min: float = -15.0,
+        p_uncond: float = 0.1,
     ) -> None:
         super().__init__()
         self.model = model
         self.log_snr_max = log_snr_max  # log-SNR at t=0 (high SNR, clean image)
         self.log_snr_min = log_snr_min  # log-SNR at t=1 (low SNR, pure noise)
+        self.p_uncond = p_uncond  # classifier-free guidance conditioning dropout
 
     def _log_snr(self, t: torch.Tensor) -> torch.Tensor:
         """Linear interpolation of log-SNR from max to min."""
@@ -407,7 +414,23 @@ class DDPM(nn.Module):
             noise = torch.randn_like(x0)
         x_t, alpha, sigma = self.q_sample(x0, t, noise)
         v_target = alpha[:, None, None, None] * noise - sigma[:, None, None, None] * x0
-        v_pred = self.model(x_t, t, cond)
+        if self.training and cond is not None and self.p_uncond > 0:
+            drop_mask = torch.rand(x0.shape[0], device=x0.device) < self.p_uncond
+            if bool(drop_mask.any()):
+                if bool(drop_mask.all()):
+                    v_pred = self.model(x_t, t, None)
+                else:
+                    v_pred_cond = self.model(x_t, t, cond)
+                    v_pred_uncond = self.model(x_t, t, None)
+                    v_pred = torch.where(
+                        drop_mask[:, None, None, None],
+                        v_pred_uncond,
+                        v_pred_cond,
+                    )
+            else:
+                v_pred = self.model(x_t, t, cond)
+        else:
+            v_pred = self.model(x_t, t, cond)
         return F.mse_loss(v_pred, v_target)
 
     @torch.no_grad()
@@ -420,7 +443,15 @@ class DDPM(nn.Module):
         return alpha, sigma, x0_pred, eps_pred
 
     @torch.no_grad()
-    def sample(self, batch_size: int, shape: Tuple[int, int, int], device: torch.device, steps: int | None = None, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def sample(
+        self,
+        batch_size: int,
+        shape: Tuple[int, int, int],
+        device: torch.device,
+        steps: int | None = None,
+        cond: Optional[torch.Tensor] = None,
+        cfg_scale: float = 1.0,
+    ) -> torch.Tensor:
         steps = steps or 50
         img = torch.randn(batch_size, *shape, device=device)
         times = torch.linspace(1.0, 0.0, steps + 1, device=device)
@@ -428,7 +459,12 @@ class DDPM(nn.Module):
             t_cur = times[i].repeat(batch_size)
             t_prev = times[i + 1].repeat(batch_size)
 
-            v_pred = self.model(img, t_cur, cond)
+            if cond is not None and cfg_scale != 1.0:
+                v_cond = self.model(img, t_cur, cond)
+                v_uncond = self.model(img, t_cur, None)
+                v_pred = v_uncond + cfg_scale * (v_cond - v_uncond)
+            else:
+                v_pred = self.model(img, t_cur, cond)
             alpha_cur, sigma_cur, x0_pred, eps_pred = self._predict_eps_x0(img, t_cur, v_pred)
 
             alpha_prev, sigma_prev = self._alpha_sigma(t_prev)

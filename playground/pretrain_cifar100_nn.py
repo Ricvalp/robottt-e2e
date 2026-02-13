@@ -531,6 +531,7 @@ def train(cfg: ConfigDict) -> None:
         model,
         log_snr_max=cfg.diffusion.log_snr_max,
         log_snr_min=cfg.diffusion.log_snr_min,
+        p_uncond=float(getattr(cfg.diffusion, "p_uncond", 0.1)),
     ).to(device)
 
     optimizer = optim.AdamW(
