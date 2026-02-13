@@ -20,8 +20,10 @@ from playground.models.conditional_model import ConditionalUNet, DDPM
 
 try:
     from playground.fid_utils import (
+        compute_fid_inception,
         compute_fid_from_samples,
         compute_reference_stats,
+        compute_reference_stats_inception,
         has_fid_stats,
         load_classifier_for_fid,
         load_fid_stats,
@@ -29,8 +31,10 @@ try:
     )
 except ImportError:
     from fid_utils import (  # type: ignore
+        compute_fid_inception,
         compute_fid_from_samples,
         compute_reference_stats,
+        compute_reference_stats_inception,
         has_fid_stats,
         load_classifier_for_fid,
         load_fid_stats,
@@ -369,40 +373,63 @@ def compute_fid_score(
     cond_indices_by_class: Dict[int, List[int]],
     classes_for_fid: List[int],
     device: torch.device,
-) -> Optional[float]:
-    """Compute classifier-feature FID for class-conditioned generation."""
+) -> Optional[Dict[str, float]]:
+    """
+    Compute classifier-feature FID and Inception FID from the same generated samples.
+    Returns a dict with any available keys:
+    - "fid_classifier"
+    - "fid_inception"
+    """
     if len(classes_for_fid) == 0:
         print("Warning: no classes available for FID, skipping.")
         return None
 
-    classifier_path = Path(cfg.fid.classifier_checkpoint)
-    if not classifier_path.exists():
-        print(f"Warning: classifier checkpoint not found at {classifier_path}, skipping FID.")
-        return None
-
-    classifier = load_classifier_for_fid(
-        checkpoint_path=str(classifier_path),
-        width=getattr(cfg.fid, "classifier_width", 64),
-        num_blocks=getattr(cfg.fid, "classifier_num_blocks", 4),
-        num_classes=100,
-        in_channels=cfg.model.in_channels,
-        device=device,
-    )
-
     stats_file = cfg.fid.stats_file
     dataset_key = cfg.fid.dataset_key
-    if not has_fid_stats(stats_file, dataset_key):
-        print(f"FID stats for '{dataset_key}' not found, computing reference stats...")
-        ref_loader = build_reference_loader(cfg, classes_for_fid)
-        mu, sigma = compute_reference_stats(
-            classifier,
-            ref_loader,
-            device,
-            extractor_type="classifier",
-        )
-        save_fid_stats(stats_file, dataset_key, mu, sigma)
+    inception_dataset_key = str(
+        getattr(cfg.fid, "inception_dataset_key", f"{dataset_key}_inception")
+    )
+    ref_loader: Optional[DataLoader] = None
 
-    reference_stats = load_fid_stats(stats_file, dataset_key)
+    def get_ref_loader() -> DataLoader:
+        nonlocal ref_loader
+        if ref_loader is None:
+            ref_loader = build_reference_loader(cfg, classes_for_fid)
+        return ref_loader
+
+    classifier = None
+    classifier_path = Path(cfg.fid.classifier_checkpoint)
+    if classifier_path.exists():
+        classifier = load_classifier_for_fid(
+            checkpoint_path=str(classifier_path),
+            width=getattr(cfg.fid, "classifier_width", 64),
+            num_blocks=getattr(cfg.fid, "classifier_num_blocks", 4),
+            num_classes=100,
+            in_channels=cfg.model.in_channels,
+            device=device,
+        )
+        if not has_fid_stats(stats_file, dataset_key):
+            print(f"FID stats for '{dataset_key}' not found, computing classifier reference stats...")
+            mu, sigma = compute_reference_stats(
+                classifier,
+                get_ref_loader(),
+                device,
+                extractor_type="classifier",
+            )
+            save_fid_stats(stats_file, dataset_key, mu, sigma)
+    else:
+        print(f"Warning: classifier checkpoint not found at {classifier_path}, skipping classifier FID.")
+
+    if not has_fid_stats(stats_file, inception_dataset_key):
+        print(
+            f"Inception FID stats for '{inception_dataset_key}' not found, "
+            "computing reference stats..."
+        )
+        mu_i, sigma_i = compute_reference_stats_inception(get_ref_loader(), device)
+        save_fid_stats(stats_file, inception_dataset_key, mu_i, sigma_i)
+
+    reference_stats_classifier = load_fid_stats(stats_file, dataset_key) if classifier is not None else None
+    reference_stats_inception = load_fid_stats(stats_file, inception_dataset_key)
 
     ddpm.eval()
     num_samples = int(cfg.fid.num_samples)
@@ -435,16 +462,28 @@ def compute_fid_score(
             all_samples.append(samples.cpu())
 
     all_samples = torch.cat(all_samples, dim=0)
-    fid_score = compute_fid_from_samples(
-        classifier,
+    metrics: Dict[str, float] = {}
+    if classifier is not None and reference_stats_classifier is not None:
+        metrics["fid_classifier"] = compute_fid_from_samples(
+            classifier,
+            all_samples,
+            reference_stats_classifier,
+            device,
+            batch_size=getattr(cfg.fid, "feature_batch_size", 64),
+            extractor_type="classifier",
+        )
+    metrics["fid_inception"] = compute_fid_inception(
         all_samples,
-        reference_stats,
+        reference_stats_inception,
         device,
-        batch_size=getattr(cfg.fid, "feature_batch_size", 64),
-        extractor_type="classifier",
+        batch_size=getattr(
+            cfg.fid,
+            "inception_feature_batch_size",
+            getattr(cfg.fid, "feature_batch_size", 64),
+        ),
     )
     ddpm.train()
-    return fid_score
+    return metrics if len(metrics) > 0 else None
 
 
 def save_checkpoint(
@@ -655,7 +694,7 @@ def train(cfg: ConfigDict) -> None:
             )
 
         if cfg.fid.enabled and epoch % cfg.training.fid_every_epochs == 0:
-            fid_score = compute_fid_score(
+            fid_metrics = compute_fid_score(
                 ddpm,
                 cfg,
                 dataset,
@@ -663,10 +702,23 @@ def train(cfg: ConfigDict) -> None:
                 classes_for_fid,
                 device,
             )
-            if fid_score is not None:
-                print(f"  FID score: {fid_score:.2f}")
+            if fid_metrics is not None:
+                fid_classifier = fid_metrics.get("fid_classifier", None)
+                fid_inception = fid_metrics.get("fid_inception", None)
+                if fid_classifier is not None:
+                    print(f"  Classifier FID: {fid_classifier:.2f}")
+                if fid_inception is not None:
+                    print(f"  Inception FID: {fid_inception:.2f}")
                 if wandb_run is not None:
-                    wandb.log({"eval/fid": fid_score}, step=global_step)
+                    wandb_logs: Dict[str, float] = {}
+                    if fid_classifier is not None:
+                        wandb_logs["eval/fid_classifier"] = fid_classifier
+                        # Backward-compatible key.
+                        wandb_logs["eval/fid"] = fid_classifier
+                    if fid_inception is not None:
+                        wandb_logs["eval/fid_inception"] = fid_inception
+                    if len(wandb_logs) > 0:
+                        wandb.log(wandb_logs, step=global_step)
                     log_x0_debug(
                         ddpm,
                         dataset,
@@ -678,8 +730,15 @@ def train(cfg: ConfigDict) -> None:
                         global_step,
                     )
 
-                if best_fid is None or fid_score < best_fid:
-                    best_fid = fid_score
+                # Keep checkpoint selection stable: prefer classifier FID when available.
+                fid_for_model_selection = (
+                    fid_classifier if fid_classifier is not None else fid_inception
+                )
+                if (
+                    fid_for_model_selection is not None
+                    and (best_fid is None or fid_for_model_selection < best_fid)
+                ):
+                    best_fid = fid_for_model_selection
                     best_path = run_save_dir / "pretrain_best_fid.pt"
                     save_checkpoint(
                         best_path,

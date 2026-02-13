@@ -61,11 +61,13 @@ def get_config():
     cfg.fid.num_samples = 1000
     cfg.fid.batch_size = 256
     cfg.fid.feature_batch_size = 256
+    cfg.fid.inception_feature_batch_size = 256
     cfg.fid.x0_log_images = 8
     cfg.fid.reference_batch_size = 256
     cfg.fid.reference_max_samples = 0
     cfg.fid.use_eval_classes = False
     cfg.fid.dataset_key = "cifar100_cond_pretrain_full"
+    cfg.fid.inception_dataset_key = "cifar100_cond_pretrain_full_inception"
     cfg.fid.classifier_checkpoint = os.environ.get(
         "CIFAR100_CLASSIFIER_CKPT",
         os.path.join(
