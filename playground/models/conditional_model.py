@@ -390,6 +390,16 @@ class DDPM(nn.Module):
         x_t = alpha[:, None, None, None] * x0 + sigma[:, None, None, None] * noise
         return x_t, alpha, sigma
 
+    def forward(
+        self,
+        x0: torch.Tensor,
+        t: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
+        cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """DDP-safe training entry point."""
+        return self.p_losses(x0=x0, t=t, noise=noise, cond=cond)
+
     def p_losses(self, x0: torch.Tensor, t: torch.Tensor | None = None, noise: torch.Tensor | None = None, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         if t is None:
             t = torch.rand(x0.shape[0], device=x0.device)

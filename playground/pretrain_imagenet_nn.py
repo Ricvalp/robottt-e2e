@@ -621,7 +621,7 @@ def train(cfg: ConfigDict) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with amp.autocast(device_type=device.type, enabled=bool(cfg.training.use_amp and device.type == "cuda")):
-                loss = ddpm_train.p_losses(imgs, cond=cond)
+                loss = ddpm_train(imgs, cond=cond)
 
             scaler.scale(loss).backward()
             if cfg.training.grad_clip is not None:
