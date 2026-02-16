@@ -77,7 +77,6 @@ def get_config():
     cfg.fid = ConfigDict()
     cfg.fid.enabled = True
     cfg.fid.backend = "pytorch_fid"
-    cfg.fid.fallback_to_internal_inception = True
     cfg.fid.num_samples = 1000
     cfg.fid.batch_size = 128
     cfg.fid.feature_batch_size = 64
@@ -100,11 +99,6 @@ def get_config():
     cfg.fid.reference_batch_size = 128
     cfg.fid.reference_max_samples = 50000
     cfg.fid.reference_dir = cfg.data.eval_dir
-    cfg.fid.dataset_key = "imagenet64_cond_pretrain_nn_inception"
-    cfg.fid.stats_file = os.environ.get(
-        "IMAGENET_FID_STATS_FILE",
-        os.path.join(os.environ.get("PLAYGROUND_OUTPUT_DIR", "playground/outputs"), "fid_stats_inception.json"),
-    )
 
     cfg.wandb = ConfigDict()
     cfg.wandb.use = True

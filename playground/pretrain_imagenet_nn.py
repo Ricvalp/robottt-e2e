@@ -28,23 +28,6 @@ from tqdm import tqdm
 from playground.dataset.imagenet_nearest_dataset import ImageNetNearestContextDataset
 from playground.models.conditional_model import ConditionalUNet, DDPM
 
-try:
-    from playground.fid_utils import (
-        compute_fid_inception,
-        compute_reference_stats_inception,
-        has_fid_stats,
-        load_fid_stats,
-        save_fid_stats,
-    )
-except ImportError:
-    from fid_utils import (  # type: ignore
-        compute_fid_inception,
-        compute_reference_stats_inception,
-        has_fid_stats,
-        load_fid_stats,
-        save_fid_stats,
-    )
-
 
 # -------------------------
 # Distributed helpers
@@ -391,6 +374,56 @@ def _pytorch_fid_available() -> bool:
     return importlib.util.find_spec("pytorch_fid") is not None
 
 
+def _collect_image_files_for_fid(root_dir: str) -> list[str]:
+    root = Path(root_dir)
+    if not root.exists():
+        return []
+    allowed_ext = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+    files = []
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in allowed_ext:
+            files.append(str(p))
+    files.sort()
+    return files
+
+
+def _build_pytorch_fid_stats_from_files(
+    files: list[str],
+    stats_path: Path,
+    cfg: ConfigDict,
+    device: torch.device,
+) -> bool:
+    if len(files) == 0:
+        print("Warning: no reference images found to build pytorch-fid stats.")
+        return False
+    try:
+        from pytorch_fid.fid_score import InceptionV3, calculate_activation_statistics
+    except Exception as exc:
+        print(f"Warning: failed to import pytorch_fid API: {exc}")
+        return False
+
+    dims = int(getattr(cfg.fid, "pytorch_fid_dims", 2048))
+    batch_size = int(getattr(cfg.fid, "pytorch_fid_batch_size", 64))
+    num_workers = int(getattr(cfg.fid, "pytorch_fid_num_workers", 0))
+    if dims not in InceptionV3.BLOCK_INDEX_BY_DIM:
+        print(f"Warning: unsupported pytorch-fid dims={dims}.")
+        return False
+
+    block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+    model = InceptionV3([block_idx]).to(device)
+    mu, sigma = calculate_activation_statistics(
+        files,
+        model,
+        batch_size=batch_size,
+        dims=dims,
+        device=device,
+        num_workers=num_workers,
+    )
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(str(stats_path), mu=mu, sigma=sigma)
+    return True
+
+
 def _ensure_pytorch_fid_reference_stats(cfg: ConfigDict, device: torch.device) -> Optional[Path]:
     stats_path_raw = str(getattr(cfg.fid, "pytorch_fid_stats_file", "")).strip()
     if stats_path_raw == "":
@@ -436,17 +469,14 @@ def _ensure_pytorch_fid_reference_stats(cfg: ConfigDict, device: torch.device) -
         if output.strip():
             print(output.strip())
         print(
-            "Falling back to in-process reference stats computation "
-            "(compatible .npz for pytorch-fid)."
+            "Falling back to in-process pytorch-fid stats computation "
+            "(manual file discovery, case-insensitive extensions)."
         )
-        try:
-            ref_loader = build_reference_loader(cfg)
-            mu, sigma = compute_reference_stats_inception(ref_loader, device)
-            np.savez(str(stats_path), mu=mu, sigma=sigma)
+        files = _collect_image_files_for_fid(ref_dir)
+        ok_api = _build_pytorch_fid_stats_from_files(files, stats_path, cfg, device)
+        if ok_api:
             return stats_path
-        except Exception as exc:
-            print(f"Warning: fallback reference stats computation failed: {exc}")
-            return None
+        return None
     return stats_path
 
 
@@ -496,9 +526,11 @@ def compute_fid_score(
     epoch: int,
     global_step: int,
 ) -> Optional[float]:
-    """Compute FID for nearest-neighbor-conditioned generation."""
+    """Compute FID with pytorch-fid for nearest-neighbor-conditioned generation."""
     backend = str(getattr(cfg.fid, "backend", "pytorch_fid")).lower()
     keep_generated = bool(getattr(cfg.fid, "keep_generated_samples", False))
+    if backend != "pytorch_fid":
+        print(f"Warning: cfg.fid.backend='{backend}' is unsupported here; using pytorch_fid.")
 
     was_training = ddpm.training
     ddpm.eval()
@@ -509,7 +541,7 @@ def compute_fid_score(
     fid_iter: Optional[Iterator] = None
 
     with torch.no_grad():
-        pbar = tqdm(total=num_samples, desc="Generating samples for Inception FID", leave=False)
+        pbar = tqdm(total=num_samples, desc="Generating samples for pytorch-FID", leave=False)
         while generated < num_samples:
             batch, fid_iter = next_batch(fid_loader, fid_iter)
             _, cond, _ = split_query_and_context(batch, device)
@@ -537,28 +569,36 @@ def compute_fid_score(
 
     all_samples = torch.cat(all_samples, dim=0)
 
-    generated_dir: Optional[Path] = None
-    if backend == "pytorch_fid":
-        generated_root = Path(
-            str(getattr(cfg.fid, "generated_samples_dir", "")).strip()
-            or str(run_save_dir / "fid_generated_samples")
+    generated_root = Path(
+        str(getattr(cfg.fid, "generated_samples_dir", "")).strip()
+        or str(run_save_dir / "fid_generated_samples")
+    )
+    generated_dir = generated_root / f"epoch_{int(epoch):04d}_step_{int(global_step):08d}"
+    _save_generated_samples(all_samples, generated_dir)
+
+    if not _pytorch_fid_available():
+        print("Warning: package 'pytorch-fid' is not installed. Install with: pip install pytorch-fid")
+        print(f"Generated samples saved at: {generated_dir}")
+        if was_training:
+            ddpm.train()
+        return None
+
+    reference_stats_path = _ensure_pytorch_fid_reference_stats(cfg, device)
+    if reference_stats_path is None:
+        ref_dir = str(getattr(cfg.fid, "reference_dir", "")).strip() or str(cfg.data.eval_dir)
+        print("Warning: could not prepare pytorch-fid reference stats.")
+        print(f"Generated samples saved at: {generated_dir}")
+        print(
+            "Manual command: "
+            f"{sys.executable} -m pytorch_fid --device {_device_arg_for_pytorch_fid(device)} "
+            f"{generated_dir} {ref_dir}"
         )
-        generated_dir = generated_root / f"epoch_{int(epoch):04d}_step_{int(global_step):08d}"
-        _save_generated_samples(all_samples, generated_dir)
+        if was_training:
+            ddpm.train()
+        return None
 
-        if _pytorch_fid_available():
-            reference_stats_path = _ensure_pytorch_fid_reference_stats(cfg, device)
-            if reference_stats_path is not None:
-                fid_score = _compute_pytorch_fid(generated_dir, reference_stats_path, cfg, device)
-                if fid_score is not None:
-                    if (not keep_generated) and generated_dir.exists():
-                        shutil.rmtree(generated_dir, ignore_errors=True)
-                    if was_training:
-                        ddpm.train()
-                    return float(fid_score)
-        else:
-            print("Warning: package 'pytorch-fid' is not installed. Install with: pip install pytorch-fid")
-
+    fid_score = _compute_pytorch_fid(generated_dir, reference_stats_path, cfg, device)
+    if fid_score is None:
         ref_dir = str(getattr(cfg.fid, "reference_dir", "")).strip() or str(cfg.data.eval_dir)
         print("Warning: could not compute pytorch-fid in-process.")
         print(f"Generated samples saved at: {generated_dir}")
@@ -567,32 +607,12 @@ def compute_fid_score(
             f"{sys.executable} -m pytorch_fid --device {_device_arg_for_pytorch_fid(device)} "
             f"{generated_dir} {ref_dir}"
         )
-        if not bool(getattr(cfg.fid, "fallback_to_internal_inception", True)):
-            if was_training:
-                ddpm.train()
-            return None
-        print("Falling back to internal Inception FID implementation.")
+        if was_training:
+            ddpm.train()
+        return None
 
-    # Internal fallback: existing in-memory Inception FID.
-    stats_file = str(cfg.fid.stats_file)
-    dataset_key = str(cfg.fid.dataset_key)
-
-    if not has_fid_stats(stats_file, dataset_key):
-        print(f"Inception FID stats for '{dataset_key}' not found, computing reference stats...")
-        ref_loader = build_reference_loader(cfg)
-        mu, sigma = compute_reference_stats_inception(ref_loader, device)
-        save_fid_stats(stats_file, dataset_key, mu, sigma)
-
-    reference_stats = load_fid_stats(stats_file, dataset_key)
-    fid_score = compute_fid_inception(
-        all_samples,
-        reference_stats,
-        device,
-        batch_size=int(getattr(cfg.fid, "feature_batch_size", 64)),
-    )
-    if generated_dir is not None and (not keep_generated) and generated_dir.exists():
+    if (not keep_generated) and generated_dir.exists():
         shutil.rmtree(generated_dir, ignore_errors=True)
-
     if was_training:
         ddpm.train()
     return float(fid_score)
@@ -879,12 +899,10 @@ def train(cfg: ConfigDict) -> None:
                     global_step=global_step,
                 )
                 if fid_score is not None:
-                    print(f"  Inception FID: {fid_score:.2f}")
+                    print(f"  pytorch-FID: {fid_score:.2f}")
                     if wandb_run is not None:
                         wandb_run.log(
                             {
-                                "eval/fid_inception": fid_score,
-                                # backward-compatible key
                                 "eval/fid": fid_score,
                             },
                             step=global_step,
