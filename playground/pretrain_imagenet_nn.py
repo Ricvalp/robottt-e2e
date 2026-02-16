@@ -397,7 +397,17 @@ def _ensure_pytorch_fid_reference_stats(cfg: ConfigDict, device: torch.device) -
         return None
     stats_path = Path(stats_path_raw)
     if stats_path.exists():
-        return stats_path
+        try:
+            with np.load(str(stats_path)) as data:
+                if "mu" in data and "sigma" in data:
+                    return stats_path
+            print(f"Warning: existing pytorch-fid stats file is invalid, rebuilding: {stats_path}")
+        except Exception:
+            print(f"Warning: failed to read existing pytorch-fid stats file, rebuilding: {stats_path}")
+        try:
+            stats_path.unlink()
+        except Exception:
+            pass
 
     ref_dir = str(getattr(cfg.fid, "reference_dir", "")).strip() or str(cfg.data.eval_dir)
     stats_path.parent.mkdir(parents=True, exist_ok=True)
@@ -425,7 +435,18 @@ def _ensure_pytorch_fid_reference_stats(cfg: ConfigDict, device: torch.device) -
         )
         if output.strip():
             print(output.strip())
-        return None
+        print(
+            "Falling back to in-process reference stats computation "
+            "(compatible .npz for pytorch-fid)."
+        )
+        try:
+            ref_loader = build_reference_loader(cfg)
+            mu, sigma = compute_reference_stats_inception(ref_loader, device)
+            np.savez(str(stats_path), mu=mu, sigma=sigma)
+            return stats_path
+        except Exception as exc:
+            print(f"Warning: fallback reference stats computation failed: {exc}")
+            return None
     return stats_path
 
 
