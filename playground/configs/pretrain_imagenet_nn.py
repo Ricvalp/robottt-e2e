@@ -68,6 +68,8 @@ def get_config():
     cfg.training.fid_every_epochs = 1
     cfg.training.checkpoint_every_epochs = 5
     cfg.training.reset_optimizer_on_resume = False
+    cfg.training.reset_optimizer_warmup_steps = 1000
+    cfg.training.reset_optimizer_warmup_start_factor = 0.1
 
     cfg.sample = ConfigDict()
     cfg.sample.steps = 100

@@ -788,9 +788,12 @@ def train(cfg: ConfigDict) -> None:
         lr=float(cfg.training.lr),
         weight_decay=float(cfg.training.weight_decay),
     )
+    use_amp_cuda = bool(cfg.training.use_amp and device.type == "cuda")
+    amp_dtype = torch.bfloat16 if use_amp_cuda else torch.float32
+    # bf16 does not need gradient scaling; keep GradScaler disabled in this mode.
     scaler = amp.GradScaler(
         device=device.type,
-        enabled=bool(cfg.training.use_amp and device.type == "cuda"),
+        enabled=False,
     )
 
     if resume_ckpt is not None and not bool(getattr(cfg.training, "reset_optimizer_on_resume", False)):
@@ -798,6 +801,26 @@ def train(cfg: ConfigDict) -> None:
             optimizer.load_state_dict(resume_ckpt["optimizer"])
         if "scaler" in resume_ckpt:
             scaler.load_state_dict(resume_ckpt["scaler"])
+
+    base_lr = float(cfg.training.lr)
+    warmup_steps_on_reset = int(getattr(cfg.training, "reset_optimizer_warmup_steps", 0))
+    warmup_start_factor = float(getattr(cfg.training, "reset_optimizer_warmup_start_factor", 0.1))
+    warmup_start_factor = max(0.0, min(1.0, warmup_start_factor))
+    warmup_active = bool(
+        resume_ckpt is not None
+        and bool(getattr(cfg.training, "reset_optimizer_on_resume", False))
+        and warmup_steps_on_reset > 0
+    )
+    warmup_step = 0
+    if warmup_active:
+        start_lr = base_lr * warmup_start_factor
+        for pg in optimizer.param_groups:
+            pg["lr"] = start_lr
+        if main:
+            print(
+                f"Enabled LR warmup after optimizer reset: "
+                f"{warmup_steps_on_reset} steps, start_factor={warmup_start_factor:.4f}."
+            )
 
     wandb_run = None
     run_save_dir = Path(cfg.checkpoint.dir)
@@ -836,7 +859,11 @@ def train(cfg: ConfigDict) -> None:
             imgs, cond, meta = split_query_and_context(batch, device)
 
             optimizer.zero_grad(set_to_none=True)
-            with amp.autocast(device_type=device.type, enabled=bool(cfg.training.use_amp and device.type == "cuda")):
+            with amp.autocast(
+                device_type=device.type,
+                enabled=use_amp_cuda,
+                dtype=amp_dtype,
+            ):
                 loss = ddpm_train(imgs, cond=cond)
 
             scaler.scale(loss).backward()
@@ -847,18 +874,31 @@ def train(cfg: ConfigDict) -> None:
             scaler.update()
 
             global_step += 1
+
+            if warmup_active:
+                warmup_step += 1
+                progress = min(1.0, warmup_step / max(1, warmup_steps_on_reset))
+                lr_scale = warmup_start_factor + (1.0 - warmup_start_factor) * progress
+                curr_lr = base_lr * lr_scale
+                for pg in optimizer.param_groups:
+                    pg["lr"] = curr_lr
+                if warmup_step >= warmup_steps_on_reset:
+                    warmup_active = False
+            else:
+                curr_lr = float(optimizer.param_groups[0]["lr"])
+
             loss_mean = reduce_mean(loss.detach(), distributed=distributed, world_size=world_size)
             loss_item = float(loss_mean.item())
             epoch_loss += loss_item
 
             if main:
-                postfix = {"loss": f"{loss_item:.4f}"}
+                postfix = {"loss": f"{loss_item:.4f}", "lr": f"{curr_lr:.2e}"}
                 if "query_label" in meta and torch.is_tensor(meta["query_label"]):
                     postfix["uniq_cls"] = int(torch.unique(meta["query_label"]).numel())
                 pbar.set_postfix(postfix)
 
                 if global_step % int(cfg.training.log_every) == 0 and wandb_run is not None:
-                    logs: Dict[str, float] = {"train/loss": loss_item}
+                    logs: Dict[str, float] = {"train/loss": loss_item, "train/lr": curr_lr}
                     if "query_label" in meta and torch.is_tensor(meta["query_label"]):
                         logs["train/unique_query_classes_in_batch"] = float(
                             torch.unique(meta["query_label"]).numel()
