@@ -10,6 +10,7 @@ import sys
 import importlib.util
 from pathlib import Path
 from typing import Dict, Iterator, Optional, Tuple
+from datetime import timedelta
 
 from absl import app
 from ml_collections import ConfigDict, config_flags
@@ -46,7 +47,7 @@ def setup_distributed(cfg: ConfigDict) -> Tuple[bool, int, int, int]:
     if backend == "nccl" and not torch.cuda.is_available():
         backend = "gloo"
 
-    dist.init_process_group(backend=backend, init_method="env://")
+    dist.init_process_group(backend=backend, init_method="env://", timeout=timedelta(minutes=60))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     return True, rank, world_size, local_rank
