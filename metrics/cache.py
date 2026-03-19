@@ -3,8 +3,12 @@ from glob import glob
 from typing import Dict
 
 import torch
-import webdataset as wds
 from torch.utils.data import DataLoader
+
+try:
+    import webdataset as wds
+except ImportError:  # pragma: no cover - optional dependency
+    wds = None
 
 from dataset import RasterizerConfig, rasterize_absolute_points
 
@@ -147,6 +151,12 @@ def cached_collate(samples):
 
 
 def get_cached_loader(shard_glob, batch_size, num_workers=4):
+    if wds is None:
+        raise ImportError(
+            "webdataset is required for cached shard loading. Install it with "
+            "'pip install webdataset'."
+        )
+
     shards = sorted(glob(shard_glob))
 
     dataset = (

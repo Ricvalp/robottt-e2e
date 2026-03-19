@@ -1,11 +1,11 @@
 from .policies import (
     DiTEncDecDiffusionPolicy,
     DiTEncDecDiffusionPolicyConfig,
+    MAMLDiTEncDecDiffusionPolicy,
 )
 
 __all__ = [
-    "DiTDiffusionPolicy",
-    "DiTDiffusionPolicyConfig",
     "DiTEncDecDiffusionPolicy",
     "DiTEncDecDiffusionPolicyConfig",
+    "MAMLDiTEncDecDiffusionPolicy",
 ]

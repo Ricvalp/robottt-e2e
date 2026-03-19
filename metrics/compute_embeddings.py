@@ -81,7 +81,7 @@ def main(_):
     rasterizer_config = RasterizerConfig(**rasterizer_config)
 
     embedding_model = ResNet18FeatureExtractor(
-        prertained_checkpoint_path=cfg.checkpoint_path
+        pretrained_checkpoint_path=cfg.checkpoint_path
     )
     embedding_model.eval()
 

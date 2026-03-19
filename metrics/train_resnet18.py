@@ -15,7 +15,7 @@ from torchvision.models import resnet18
 from metrics import get_cached_loader
 
 _CONFIG_FILE = config_flags.DEFINE_config_file(
-    "config", default="/configs/fid/train.py"
+    "config", default="configs/metrics/train.py"
 )
 
 
