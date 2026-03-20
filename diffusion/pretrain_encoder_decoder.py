@@ -5,6 +5,7 @@ Train a DiT-based diffusion policy on QuickDraw episodes using the existing data
 
 from __future__ import annotations
 
+from typing import Any
 from pathlib import Path
 
 import matplotlib
@@ -151,9 +152,67 @@ def _log_qualitative_samples(
         policy.train()
 
 
+def _state_dict_or_none(obj: Any) -> Any:
+    if obj is None:
+        return None
+    return obj.state_dict()
+
+
+def _load_state_dict_if_present(obj: Any, state_dict: Any) -> None:
+    if obj is None or state_dict is None:
+        return
+    obj.load_state_dict(state_dict)
+
+
+def _save_checkpoint(
+    ckpt_path: Path,
+    *,
+    epoch: int,
+    step: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: Any,
+    cfg: ConfigDict,
+) -> None:
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "epoch": int(epoch),
+            "step": int(step),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": _state_dict_or_none(scheduler),
+            "scaler": _state_dict_or_none(scaler),
+            "config": cfg.to_dict(),
+        },
+        ckpt_path,
+    )
+
+
+def _load_checkpoint(
+    ckpt_path: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: Any,
+    device: torch.device,
+) -> tuple[int, int]:
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    _load_state_dict_if_present(scheduler, checkpoint.get("scheduler"))
+    _load_state_dict_if_present(scaler, checkpoint.get("scaler"))
+
+    start_epoch = int(checkpoint.get("epoch", 0))
+    global_step = int(checkpoint.get("step", 0))
+    return start_epoch, global_step
+
+
 _CONFIG_FILE = config_flags.DEFINE_config_file(
     "config",
-    default="configs/diffusion/encoder_decoder_in_context_imitation_learning.py",
+    default="configs/diffusion/pretrain_encoder_decoder.py",
 )
 
 
@@ -173,6 +232,7 @@ def main(_) -> None:
         builder_cls=EpisodeBuilderSimilar,
         index_dir=cfg.data.index_dir,
         ids_dir=cfg.data.ids_dir,
+        families_cache_path=cfg.data.families_cache_path,
     )
     collator = ContextQueryInContextDiffusionCollator(
         horizon=cfg.model.horizon, seed=cfg.run.seed
@@ -198,6 +258,7 @@ def main(_) -> None:
         builder_cls=EpisodeBuilderSimilar,
         index_dir=cfg.data.index_dir,
         ids_dir=cfg.data.ids_dir,
+        families_cache_path=cfg.data.families_cache_path,
     )
     eval_collator = ContextQueryInContextDiffusionCollator(
         horizon=cfg.model.horizon, seed=cfg.run.seed
@@ -257,7 +318,10 @@ def main(_) -> None:
     else:
         scheduler = None
 
+    scaler = None
+
     base_save_dir = Path(cfg.checkpoint.dir)
+    latest_ckpt_path = base_save_dir / cfg.checkpoint.latest_filename
 
     if cfg.wandb.use and cfg.wandb.project:
         wandb.init(
@@ -282,11 +346,31 @@ def main(_) -> None:
         save_dir = base_save_dir
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    resume_path = None
+    if cfg.checkpoint.resume_from:
+        resume_path = Path(cfg.checkpoint.resume_from)
+    elif cfg.checkpoint.auto_resume and latest_ckpt_path.exists():
+        resume_path = latest_ckpt_path
+
+    start_epoch = 0
     global_step = 0
+    if resume_path is not None:
+        start_epoch, global_step = _load_checkpoint(
+            resume_path,
+            model=policy,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            device=device,
+        )
+        print(
+            f"Resumed from checkpoint {resume_path} "
+            f"(epoch={start_epoch}, step={global_step})"
+        )
 
     eval_iterator = iter(eval_dataloader)
 
-    for epoch in range(cfg.training.epochs):
+    for epoch in range(start_epoch, cfg.training.epochs):
         policy.train()
         progress = tqdm(
             dataloader, desc=f"Epoch {epoch+1}/{cfg.training.epochs}", leave=False
@@ -320,6 +404,22 @@ def main(_) -> None:
                     step=global_step,
                 )
 
+            if (
+                cfg.checkpoint.save_latest_every_steps is not None
+                and cfg.checkpoint.save_latest_every_steps > 0
+                and global_step % cfg.checkpoint.save_latest_every_steps == 0
+            ):
+                _save_checkpoint(
+                    latest_ckpt_path,
+                    epoch=epoch,
+                    step=global_step,
+                    model=policy,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    cfg=cfg,
+                )
+            
         try:
             eval_batch = next(eval_iterator)
         except StopIteration:
@@ -344,19 +444,31 @@ def main(_) -> None:
             split="train",
         )
 
+        _save_checkpoint(
+            latest_ckpt_path,
+            epoch=epoch + 1,
+            step=global_step,
+            model=policy,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            cfg=cfg,
+        )
+
         if (
             cfg.checkpoint.save_interval is not None
             and (epoch + 1) % max(1, cfg.checkpoint.save_interval) == 0
         ):
             checkpoint_path = save_dir / f"policy_epoch_{epoch+1:03d}.pt"
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": policy.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "config": policy_cfg,
-                },
+            _save_checkpoint(
                 checkpoint_path,
+                epoch=epoch + 1,
+                step=global_step,
+                model=policy,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                cfg=cfg,
             )
 
     if cfg.wandb.use:

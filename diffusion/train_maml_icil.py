@@ -643,7 +643,7 @@ def maml_step(
 
 _CONFIG = config_flags.DEFINE_config_file(
     "config",
-    default="configs/train_maml_icil.py",
+    default="configs/diffusion/train_maml_icil.py",
 )
 
 def load_config(config_flag) -> ConfigDict:
@@ -688,6 +688,7 @@ def main(argv: List[str] | None = None) -> None:
         index_dir=config.data.index_dir,
         ids_dir=config.data.ids_dir,
         seed=config.run.seed,
+        families_cache_path=config.data.families_cache_path,
     )
     
     eval_dataset = QuickDrawEpisodesMAML(
@@ -702,6 +703,7 @@ def main(argv: List[str] | None = None) -> None:
         index_dir=config.data.index_dir,
         ids_dir=config.data.ids_dir,
         seed=config.run.seed + 1234,
+        families_cache_path=config.data.families_cache_path,
     )
     
     noise_scheduler_kwargs = {
@@ -790,7 +792,10 @@ def main(argv: List[str] | None = None) -> None:
         use=config.profiling.use,
         start_step=0,
         end_step=3,
-        trace_path=config.profiling.trace_dir + "trace.json"
+        trace_path=os.path.join(
+            config.profiling.trace_dir,
+            config.profiling.trace_filename,
+        ),
     )
 
     global_step = 0

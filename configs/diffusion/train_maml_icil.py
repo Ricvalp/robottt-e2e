@@ -1,7 +1,31 @@
+import os
+
 from ml_collections import ConfigDict, config_dict
 
 
 def get_config() -> ConfigDict:
+    cache_root = os.environ.get(
+        "QRD_CACHE_ROOT",
+        "/mnt/external_storage/robotics/quick_robot_draw/data",
+    )
+    index_root = os.environ.get(
+        "QRD_INDEX_ROOT",
+        "/mnt/external_storage/robotics/quick_robot_draw/index",
+    )
+    checkpoint_parent_dir = os.environ.get(
+        "QRD_CHECKPOINT_PARENT_DIR",
+        "/mnt/external_storage/robotics/quick_robot_draw/runs/checkpoints",
+    )
+    profile_trace_dir = os.environ.get(
+        "QRD_PROFILE_TRACE_DIR",
+        "/mnt/external_storage/robotics/quick_robot_draw/runs/profiles",
+    )
+    trace_filename = os.environ.get(
+        "QRD_PROFILE_TRACE_FILE",
+        os.environ.get("QRD_TTT_PROFILE_TRACE_FILE", "trace.json"),
+    )
+    wandb_project = os.environ.get("WANDB_PROJECT", "qrd-pretrain")
+    wandb_entity = os.environ.get("WANDB_ENTITY", "ricvalp")
 
     cfg = ConfigDict()
 
@@ -10,7 +34,7 @@ def get_config() -> ConfigDict:
     cfg.run.device = "cuda"  # or "cpu"
 
     cfg.data = ConfigDict()
-    cfg.data.root = config_dict.placeholder(str)
+    cfg.data.root = cache_root
     cfg.data.split = "train"
     cfg.data.backend = "lmdb"
     cfg.data.K = 4
@@ -18,8 +42,9 @@ def get_config() -> ConfigDict:
     cfg.data.max_query_len = 60
     cfg.data.max_context_len = 400
     cfg.data.coordinate_mode = "absolute"
-    cfg.data.index_dir = "metrics/index/faiss_index/"
-    cfg.data.ids_dir = "metrics/index/ids_family/"
+    cfg.data.index_dir = os.path.join(index_root, "faiss_index")
+    cfg.data.ids_dir = os.path.join(index_root, "ids_family")
+    cfg.data.families_cache_path = "all_families.txt"
 
     cfg.loader = ConfigDict()
     cfg.loader.batch_size = 8
@@ -72,7 +97,7 @@ def get_config() -> ConfigDict:
     cfg.model.horizon = 8
 
     cfg.checkpoint = ConfigDict()
-    cfg.checkpoint.dir = "diffusion/checkpoints/encoder_decoder"
+    cfg.checkpoint.dir = os.path.join(checkpoint_parent_dir, "encoder_decoder")
     cfg.checkpoint.save_interval = 1
 
     cfg.eval = ConfigDict()
@@ -83,12 +108,13 @@ def get_config() -> ConfigDict:
 
     cfg.profiling = ConfigDict()
     cfg.profiling.use = True
-    cfg.profiling.trace_dir = "profiling/diffusion/encoder_decoder/"
+    cfg.profiling.trace_dir = os.path.join(profile_trace_dir, "encoder_decoder")
+    cfg.profiling.trace_filename = trace_filename
 
     cfg.wandb = ConfigDict()
     cfg.wandb.use = True
-    cfg.wandb.project = "diffusion-in-context-imitation-learning-sweeps"
-    cfg.wandb.entity = "ricvalp"
+    cfg.wandb.project = wandb_project
+    cfg.wandb.entity = wandb_entity
     cfg.wandb.samples_log_interval = 500
     cfg.wandb.log_all = False
 

@@ -92,6 +92,22 @@ class WarmupCosineScheduler:
     def get_last_lr(self):
         return self.optimizer.param_groups[0]["lr"]
 
+    def state_dict(self):
+        return {
+            "step_num": self.step_num,
+            "warmup_steps": self.warmup_steps,
+            "total_steps": self.total_steps,
+            "max_lr": self.max_lr,
+            "min_lr": self.min_lr,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.step_num = int(state_dict["step_num"])
+        self.warmup_steps = int(state_dict["warmup_steps"])
+        self.total_steps = int(state_dict["total_steps"])
+        self.max_lr = float(state_dict["max_lr"])
+        self.min_lr = float(state_dict["min_lr"])
+
 
 class CosineAnnealingLR(torch.optim.lr_scheduler.CosineAnnealingLR):
     """

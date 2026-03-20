@@ -556,27 +556,3 @@ if __name__ == "__main__":
 
     loss, metrics = dit.compute_loss(batch)
     print(f"Loss: {loss.item()}, Metrics: {metrics}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-############
-############
-############
-############
-############
-############
-############
-
-

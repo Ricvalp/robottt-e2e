@@ -24,6 +24,39 @@ from dataset.storage import DatasetManifest, SketchStorage, StorageConfig
 __all__ = ["QuickDrawEpisodes", "QuickDrawEpisodesMAML", "QuickDrawSketches"]
 
 
+def _resolve_families_cache_path(
+    root: str, families_cache_path: Optional[str]
+) -> Path:
+    if families_cache_path is None:
+        return Path(root) / "all_families.txt"
+
+    cache_path = Path(families_cache_path)
+    if cache_path.is_absolute():
+        return cache_path
+    return Path(root) / cache_path
+
+
+def _load_all_families(
+    sketch_storage: SketchStorage,
+    *,
+    root: str,
+    families_cache_path: Optional[str] = None,
+) -> List[str]:
+    cache_path = _resolve_families_cache_path(root, families_cache_path)
+
+    if cache_path.exists():
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            families = [line.strip() for line in handle if line.strip()]
+        if families:
+            return families
+
+    families = sketch_storage.families()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(families))
+    return families
+
+
 class QuickDrawEpisodes(Dataset):
     """
     PyTorch dataset that lazily assembles K-shot prompt/query episodes.
@@ -68,6 +101,7 @@ class QuickDrawEpisodes(Dataset):
         builder_cls: EpisodeBuilder = EpisodeBuilder,
         index_dir: Optional[str] = None,
         ids_dir: Optional[str] = None,
+        families_cache_path: Optional[str] = None,
     ) -> None:
         self.root = root
         self.split = split
@@ -81,6 +115,7 @@ class QuickDrawEpisodes(Dataset):
         self.builder_cls = builder_cls
         self.index_dir = index_dir
         self.ids_dir = ids_dir
+        self.families_cache_path = families_cache_path
 
         manifest_path = os.path.join(root, "DatasetManifest.json")
         if not os.path.exists(manifest_path):
@@ -94,7 +129,11 @@ class QuickDrawEpisodes(Dataset):
         self.storage_config = storage_config
 
         tmp_sketch_storage = SketchStorage(storage_config, mode="r")
-        all_families = tmp_sketch_storage.families()
+        all_families = _load_all_families(
+            tmp_sketch_storage,
+            root=self.root,
+            families_cache_path=self.families_cache_path,
+        )
         self.family_to_samples: Dict[str, List[str]] = {}
 
         assigned_families = self._resolve_split_families(all_families)
@@ -318,6 +357,7 @@ class QuickDrawEpisodesMAML(Dataset):
         coordinate_mode: str = "delta",
         index_dir: Optional[str] = None,
         ids_dir: Optional[str] = None,
+        families_cache_path: Optional[str] = None,
     ) -> None:
         self.root = root
         self.split = split
@@ -330,6 +370,7 @@ class QuickDrawEpisodesMAML(Dataset):
         self.coordinate_mode = coordinate_mode
         self.index_dir = index_dir
         self.ids_dir = ids_dir
+        self.families_cache_path = families_cache_path
 
         manifest_path = os.path.join(root, "DatasetManifest.json")
         if not os.path.exists(manifest_path):
@@ -343,15 +384,11 @@ class QuickDrawEpisodesMAML(Dataset):
         self.storage_config = storage_config
 
         tmp_sketch_storage = SketchStorage(storage_config, mode="r")
-
-        all_families_path = Path(self.root) / "all_families.txt"
-        if all_families_path.exists():
-            with open(all_families_path, "r", encoding="utf-8") as f:
-                all_families = f.read().splitlines()
-        else:
-            all_families = tmp_sketch_storage.families()
-            with open(all_families_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(all_families))
+        all_families = _load_all_families(
+            tmp_sketch_storage,
+            root=self.root,
+            families_cache_path=self.families_cache_path,
+        )
 
         self.family_to_samples: Dict[str, List[str]] = {}
 
