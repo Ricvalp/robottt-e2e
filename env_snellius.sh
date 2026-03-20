@@ -7,7 +7,7 @@
 # =============================================================================
 
 # Root of cached QuickDraw data.
-export QRD_CACHE_ROOT="/projects/prjs1905/robotics/quick_robot_draw/data"
+export QRD_CACHE_ROOT="/projects/prjs1905/robotics/quick_robot_draw/data/train-val-split"
 
 # Root of QuickDraw faiss index.
 export QRD_INDEX_ROOT="/projects/prjs1905/robotics/quick_robot_draw/index"
