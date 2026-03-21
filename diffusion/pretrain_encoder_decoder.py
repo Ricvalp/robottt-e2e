@@ -287,6 +287,7 @@ def main(_) -> None:
         mlp_dim=cfg.model.mlp_dim,
         dropout=cfg.model.dropout,
         attention_dropout=cfg.model.attention_dropout,
+        prediction_type=cfg.model.prediction_type,
         num_inference_steps=cfg.eval.num_inference_steps,
         noise_scheduler_kwargs=noise_scheduler_kwargs,
     )

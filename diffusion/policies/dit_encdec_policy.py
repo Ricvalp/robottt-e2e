@@ -45,6 +45,53 @@ class SinusoidalTimeEmbedding(nn.Module):
         return emb
 
 
+def _normalize_prediction_type(prediction_type: str) -> str:
+    value = str(prediction_type).strip().lower()
+    aliases = {
+        "epsilon": "epsilon",
+        "eps": "epsilon",
+        "sample": "sample",
+        "x0": "sample",
+        "v_prediction": "v_prediction",
+        "v": "v_prediction",
+    }
+    if value not in aliases:
+        raise ValueError(
+            "Unsupported prediction_type "
+            f"'{prediction_type}'. Expected one of: epsilon/eps, sample/x0, v_prediction/v."
+        )
+    return aliases[value]
+
+
+def _diffusion_training_target(
+    noise_scheduler: DDPMScheduler,
+    *,
+    x0: torch.Tensor,
+    noise: torch.Tensor,
+    timesteps: torch.Tensor,
+) -> torch.Tensor:
+    pred_type = _normalize_prediction_type(noise_scheduler.config.prediction_type)
+    if pred_type == "epsilon":
+        return noise
+    if pred_type == "sample":
+        return x0
+    if pred_type == "v_prediction":
+        if hasattr(noise_scheduler, "get_velocity"):
+            return noise_scheduler.get_velocity(x0, noise, timesteps)
+
+        alphas_cumprod = noise_scheduler.alphas_cumprod.to(
+            device=x0.device, dtype=x0.dtype
+        )
+        alpha_t = alphas_cumprod[timesteps].sqrt()
+        sigma_t = (1.0 - alphas_cumprod[timesteps]).sqrt()
+        while alpha_t.ndim < x0.ndim:
+            alpha_t = alpha_t.unsqueeze(-1)
+            sigma_t = sigma_t.unsqueeze(-1)
+        return alpha_t * noise - sigma_t * x0
+
+    raise ValueError(f"Unsupported prediction type {pred_type}")
+
+
 @dataclass
 class DiTEncDecDiffusionPolicyConfig:
     horizon: int
@@ -61,6 +108,7 @@ class DiTEncDecDiffusionPolicyConfig:
     scalar_embedding_hidden_dim: int = 128
     time_embedding_base: float = 10000.0
     diffusion_embedding_base: float = 10000.0
+    prediction_type: str = "epsilon"
     num_inference_steps: int = 50
     noise_scheduler_kwargs: Dict[str, object] | None = None
 
@@ -126,6 +174,17 @@ class DiTEncDecDiffusionPolicy(nn.Module):
         )
 
         scheduler_kwargs = dict(cfg.noise_scheduler_kwargs or {})
+        normalized_prediction_type = _normalize_prediction_type(cfg.prediction_type)
+        existing_prediction_type = scheduler_kwargs.get("prediction_type")
+        if existing_prediction_type is not None:
+            existing_prediction_type = _normalize_prediction_type(existing_prediction_type)
+            if existing_prediction_type != normalized_prediction_type:
+                raise ValueError(
+                    "prediction_type mismatch between cfg.prediction_type "
+                    f"('{cfg.prediction_type}') and noise_scheduler_kwargs "
+                    f"('{scheduler_kwargs['prediction_type']}')."
+                )
+        scheduler_kwargs["prediction_type"] = normalized_prediction_type
         self.scheduler = DDPMScheduler(**scheduler_kwargs)
         self.num_inference_steps = cfg.num_inference_steps
 
@@ -179,6 +238,7 @@ class DiTEncDecDiffusionPolicy(nn.Module):
         context = batch["context"]
         history = batch["history"]
         actions = batch["actions"]
+        x0 = actions
         query_mask = batch["query_mask"]
         context_mask = batch["context_mask"]
 
@@ -190,7 +250,7 @@ class DiTEncDecDiffusionPolicy(nn.Module):
             device=actions.device,
             dtype=torch.long,
         )
-        noisy_actions = self.scheduler.add_noise(actions, noise, timesteps)
+        noisy_actions = self.scheduler.add_noise(x0, noise, timesteps)
 
         context_tokens = self._encode_context(context)
         history_tokens = self._encode_history(history)
@@ -213,8 +273,13 @@ class DiTEncDecDiffusionPolicy(nn.Module):
         )
 
         pred = self.output_head(decoded[:, -self.cfg.horizon :, :])
-
-        loss = F.mse_loss(pred, noise)
+        target = _diffusion_training_target(
+            self.scheduler,
+            x0=x0,
+            noise=noise,
+            timesteps=timesteps,
+        )
+        loss = F.mse_loss(pred, target)
         metrics = {"mse": float(loss.detach().cpu())}
         return loss, metrics
 
@@ -282,9 +347,9 @@ class DiTEncDecDiffusionPolicy(nn.Module):
                 diffusion_time_cond=diffusion_cond,
             )
 
-            noise_pred = self.output_head(decoded[:, -self.cfg.horizon :, :])
+            model_pred = self.output_head(decoded[:, -self.cfg.horizon :, :])
             scheduler_step = self.scheduler.step(
-                noise_pred,
+                model_pred,
                 timestep,
                 sample,
                 generator=generator,
@@ -355,6 +420,17 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
         )
 
         scheduler_kwargs = dict(cfg.noise_scheduler_kwargs or {})
+        normalized_prediction_type = _normalize_prediction_type(cfg.prediction_type)
+        existing_prediction_type = scheduler_kwargs.get("prediction_type")
+        if existing_prediction_type is not None:
+            existing_prediction_type = _normalize_prediction_type(existing_prediction_type)
+            if existing_prediction_type != normalized_prediction_type:
+                raise ValueError(
+                    "prediction_type mismatch between cfg.prediction_type "
+                    f"('{cfg.prediction_type}') and noise_scheduler_kwargs "
+                    f"('{scheduler_kwargs['prediction_type']}')."
+                )
+        scheduler_kwargs["prediction_type"] = normalized_prediction_type
         self.scheduler = DDPMScheduler(**scheduler_kwargs)
         self.num_inference_steps = cfg.num_inference_steps
 
@@ -408,6 +484,7 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
         context = batch["context"]
         history = batch["history"]
         actions = batch["actions"]
+        x0 = actions
         query_mask = batch["query_mask"]
         context_mask = batch["context_mask"]
 
@@ -427,7 +504,7 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
             )
         # ---------------------------------------------------
 
-        noisy_actions = self.scheduler.add_noise(actions, noise, timesteps)
+        noisy_actions = self.scheduler.add_noise(x0, noise, timesteps)
 
         context_tokens = self._encode_context(context)
         history_tokens = self._encode_history(history)
@@ -450,8 +527,13 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
         )
 
         pred = self.output_head(decoded[:, -self.cfg.horizon :, :])
-
-        loss = F.mse_loss(pred, noise)
+        target = _diffusion_training_target(
+            self.scheduler,
+            x0=x0,
+            noise=noise,
+            timesteps=timesteps,
+        )
+        loss = F.mse_loss(pred, target)
         metrics = {"mse": float(loss.detach().cpu())}
         return loss, metrics
 
@@ -521,9 +603,9 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
                 diffusion_time_cond=diffusion_cond,
             )
 
-            noise_pred = self.output_head(decoded[:, -self.cfg.horizon :, :])
+            model_pred = self.output_head(decoded[:, -self.cfg.horizon :, :])
             scheduler_step = self.scheduler.step(
-                noise_pred,
+                model_pred,
                 timestep,
                 sample,
                 generator=generator,

@@ -7,10 +7,10 @@
 # =============================================================================
 
 # Root of cached RLBench dense H5 variations.
-export QRD_CACHE_ROOT="/mnt/external_storage/robotics/quick_robot_draw/data"
+export QRD_CACHE_ROOT="data/train-val-split"
 
 # Root of cached QuickDraw faiss index.
-export QRD_INDEX_ROOT="/mnt/external_storage/robotics/quick_robot_draw/index"
+export QRD_INDEX_ROOT="metrics/index"
 
 # =============================================================================
 # OUTPUT DIRECTORIES

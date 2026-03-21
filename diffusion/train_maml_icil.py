@@ -723,6 +723,7 @@ def main(argv: List[str] | None = None) -> None:
         mlp_dim=config.model.mlp_dim,
         dropout=config.model.dropout,
         attention_dropout=config.model.attention_dropout,
+        prediction_type=config.model.prediction_type,
         num_inference_steps=config.eval.num_inference_steps,
         noise_scheduler_kwargs=noise_scheduler_kwargs,
     )

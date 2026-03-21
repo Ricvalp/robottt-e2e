@@ -72,6 +72,7 @@ def get_config() -> ConfigDict:
     cfg.model.beta_start = 1e-4
     cfg.model.beta_end = 2e-2
     cfg.model.beta_schedule = "scaled_linear"
+    cfg.model.prediction_type = "v_prediction"
     cfg.model.hidden_dim = 512
     cfg.model.num_layers = 4
     cfg.model.num_heads = 4
@@ -89,9 +90,9 @@ def get_config() -> ConfigDict:
     cfg.checkpoint.resume_from = None
 
     cfg.eval = ConfigDict()
-    cfg.eval.samples = 8
+    cfg.eval.samples = 16
     cfg.eval.seed = 42
-    cfg.eval.num_inference_steps = 300
+    cfg.eval.num_inference_steps = 1000
     cfg.eval.eval_on_train = False
 
     cfg.profiling = ConfigDict()
