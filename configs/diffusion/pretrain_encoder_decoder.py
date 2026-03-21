@@ -83,7 +83,7 @@ def get_config() -> ConfigDict:
 
     cfg.checkpoint = ConfigDict()
     cfg.checkpoint.dir = os.path.join(checkpoint_parent_dir, "encoder_decoder")
-    cfg.checkpoint.save_interval = 10
+    cfg.checkpoint.save_interval = 1
     cfg.checkpoint.latest_filename = "latest.pt"
     cfg.checkpoint.save_latest_every_steps = None
     cfg.checkpoint.auto_resume = False
