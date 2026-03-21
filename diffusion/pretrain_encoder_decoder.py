@@ -406,6 +406,36 @@ def main(_) -> None:
                 )
 
             if (
+                cfg.wandb.use
+                and cfg.wandb.log_samples_interval is not None
+                and cfg.wandb.log_samples_interval > 0
+                and global_step % cfg.wandb.log_samples_interval == 0
+            ):
+                try:
+                    eval_batch = next(eval_iterator)
+                except StopIteration:
+                    eval_iterator = iter(eval_dataloader)
+                    eval_batch = next(eval_iterator)
+
+                _log_qualitative_samples(
+                    policy=policy,
+                    context=eval_batch,
+                    cfg=cfg,
+                    step=global_step,
+                    device=device,
+                    split="eval",
+                )
+
+                _log_qualitative_samples(
+                    policy=policy,
+                    context={key: batch[key][: cfg.eval.samples] for key in batch.keys()},
+                    cfg=cfg,
+                    step=global_step,
+                    device=device,
+                    split="train",
+                )
+
+            if (
                 cfg.checkpoint.save_latest_every_steps is not None
                 and cfg.checkpoint.save_latest_every_steps > 0
                 and global_step % cfg.checkpoint.save_latest_every_steps == 0
@@ -420,30 +450,6 @@ def main(_) -> None:
                     scaler=scaler,
                     cfg=cfg,
                 )
-            
-        try:
-            eval_batch = next(eval_iterator)
-        except StopIteration:
-            eval_iterator = iter(eval_dataloader)
-            eval_batch = next(eval_iterator)
-
-        _log_qualitative_samples(
-            policy=policy,
-            context=eval_batch,
-            cfg=cfg,
-            step=global_step,
-            device=device,
-            split="eval",
-        )
-
-        _log_qualitative_samples(
-            policy=policy,
-            context={key: batch[key][: cfg.eval.samples] for key in batch.keys()},
-            cfg=cfg,
-            step=global_step,
-            device=device,
-            split="train",
-        )
 
         _save_checkpoint(
             latest_ckpt_path,
