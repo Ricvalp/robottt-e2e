@@ -12,12 +12,14 @@ export QRD_CACHE_ROOT="data/train-val-split"
 # Root of cached QuickDraw faiss index.
 export QRD_INDEX_ROOT="metrics/index"
 
+export QRD_RESNET_CHECKPOINT_PARENT_DIR="metrics/checkpoints"
+
 # =============================================================================
 # OUTPUT DIRECTORIES
 # =============================================================================
 
 # Parent directory for run outputs (each run uses a subdirectory named by wandb run id).
-export QRD_OUTPUT_PARENT_DIR="/mnt/external_storage/robotics/quick_robot_draw/runs/outputs"
+export QRD_OUTPUT_PARENT_DIR="outputs" # "/mnt/external_storage/robotics/quick_robot_draw/runs/outputs"
 
 # Parent directory for checkpoints (each run uses a subdirectory named by wandb run id).
 export QRD_CHECKPOINT_PARENT_DIR="/mnt/external_storage/robotics/quick_robot_draw/runs/checkpoints"
@@ -43,6 +45,8 @@ export WANDB_MODE="online"
 
 echo "[env.sh] QRD_CACHE_ROOT=${QRD_CACHE_ROOT}"
 echo "[env.sh] QRD_OUTPUT_PARENT_DIR=${QRD_OUTPUT_PARENT_DIR}"
+echo "[env.sh] QRD_INDEX_ROOT=${QRD_INDEX_ROOT}"
+echo "[env.sh] QRD_RESNET_CHECKPOINT_PARENT_DIR=${QRD_RESNET_CHECKPOINT_PARENT_DIR}"
 echo "[env.sh] QRD_CHECKPOINT_PARENT_DIR=${QRD_CHECKPOINT_PARENT_DIR}"
 echo "[env.sh] QRD_PROFILE_TRACE_DIR=${QRD_PROFILE_TRACE_DIR}"
 echo "[env.sh] QRD_PRETRAIN_PROFILE_TRACE_FILE=${QRD_PRETRAIN_PROFILE_TRACE_FILE}"

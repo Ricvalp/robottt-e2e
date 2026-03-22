@@ -26,6 +26,8 @@ playground/checkpoints/
 playground/classifier_checkpoints/
 playground/checkpoint*
 
+eval_checkpoints/
+
 checkpoints_cond/
 
 
