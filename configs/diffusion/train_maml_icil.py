@@ -110,6 +110,7 @@ def get_config() -> ConfigDict:
     cfg.checkpoint = ConfigDict()
     cfg.checkpoint.dir = os.path.join(checkpoint_parent_dir, "encoder_decoder")
     cfg.checkpoint.save_interval = 1
+    cfg.checkpoint.save_latest_every_steps = 0
 
     cfg.eval = ConfigDict()
     cfg.eval.samples = 8

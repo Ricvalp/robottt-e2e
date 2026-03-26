@@ -1286,6 +1286,21 @@ def main(argv: List[str] | None = None) -> None:
     else:
         save_dir = base_save_dir
     save_dir.mkdir(parents=True, exist_ok=True)
+    latest_ckpt_path = save_dir / "latest.pt"
+
+    def _checkpoint_payload() -> Dict[str, Any]:
+        return {
+            "epoch": epoch,
+            "global_step": global_step,
+            "model": policy.state_dict(),
+            "outer_opt": outer_opt.state_dict(),
+            "policy_cfg": asdict(policy_cfg),
+            "fast_names": fast_names,
+            "outer_names": outer_names,
+            "resolved": run_config["resolved"],
+            "config": run_config,
+            "maml_cfg": asdict(cfg),
+        }
 
     worker_seed = config.run.seed
     g = torch.Generator()
@@ -1403,23 +1418,16 @@ def main(argv: List[str] | None = None) -> None:
                         max_tokens=resolved_logging_max_tokens,
                     )
 
+            if (
+                config.checkpoint.save_latest_every_steps > 0
+                and global_step % config.checkpoint.save_latest_every_steps == 0
+            ):
+                torch.save(_checkpoint_payload(), latest_ckpt_path)
+                print(f"Saved checkpoint: {latest_ckpt_path}")
+
         if epoch % config.checkpoint.save_interval == 0:
             ckpt_path = save_dir / f"maml_epoch_{epoch:03d}.pt"
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "model": policy.state_dict(),
-                    "outer_opt": outer_opt.state_dict(),
-                    "policy_cfg": asdict(policy_cfg),
-                    "fast_names": fast_names,
-                    "outer_names": outer_names,
-                    "resolved": run_config["resolved"],
-                    "config": run_config,
-                    "maml_cfg": asdict(cfg),
-                },
-                ckpt_path,
-            )
+            torch.save(_checkpoint_payload(), ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
 
 
