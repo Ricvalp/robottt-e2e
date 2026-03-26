@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Tuple
 
@@ -278,6 +279,22 @@ def _resolve_checkpoint_path(cfg: ConfigDict) -> Path:
     return checkpoint_path
 
 
+def _resolve_output_dir(cfg: ConfigDict, checkpoint_path: Path) -> Path:
+    checkpoint_path = checkpoint_path.expanduser().resolve()
+    checkpoint_root = Path(cfg.checkpoint.dir).expanduser().resolve()
+    if checkpoint_path.parent == checkpoint_root:
+        raise ValueError(
+            "Cannot infer a W&B run id from a checkpoint stored directly under "
+            f"{checkpoint_root}. Use a checkpoint inside a run-id directory."
+        )
+
+    run_id = checkpoint_path.parent.name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(cfg.logging.output_parent_dir).expanduser() / run_id / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
 def _policy_cfg_from_checkpoint(saved_cfg: dict) -> DiTEncDecDiffusionPolicyConfig:
     model_cfg = saved_cfg["model"]
     eval_cfg = saved_cfg["eval"]
@@ -359,6 +376,11 @@ def _build_loader(
     )
 
 
+def _resolve_inference_steps(cfg: ConfigDict) -> Optional[int]:
+    value = int(getattr(cfg.eval, "inference_steps", 0))
+    return value if value > 0 else None
+
+
 def _save_empty_sketch_samples(
     *,
     policy: DiTEncDecDiffusionPolicy,
@@ -380,6 +402,7 @@ def _save_empty_sketch_samples(
             "context_mask": batch["context_mask"],
         },
         generator=generator,
+        inference_steps=_resolve_inference_steps(cfg),
     )
 
     batch_size = len(samples)
@@ -443,6 +466,7 @@ def _save_partial_sketch_samples(
             "query_mask": batch["query_mask"],
         },
         generator=generator,
+        inference_steps=_resolve_inference_steps(cfg),
     )
 
     batch_size = len(samples)
@@ -518,6 +542,7 @@ def _save_many_samples(
             "context_mask": context_mask,
         },
         generator=generator,
+        inference_steps=_resolve_inference_steps(cfg),
     )
 
     valid_ctx = base_context[0][base_context_mask[0]].detach().cpu()
@@ -609,6 +634,7 @@ def _collect_generated_and_gt_queries(
                     "context_mask": batch["context_mask"],
                 },
                 generator=generator,
+                inference_steps=_resolve_inference_steps(cfg),
             )
             gt_batch = _query_sketches_from_batch(batch)
 
@@ -788,13 +814,15 @@ def main(_) -> None:
     cfg = load_config(_CONFIG_FILE)
     set_seed(cfg.run.seed)
     device = torch.device(cfg.run.device if torch.cuda.is_available() else "cpu")
-    Path(cfg.logging.dir).mkdir(parents=True, exist_ok=True)
 
     policy, checkpoint_cfg, checkpoint_path = _load_policy_from_checkpoint(cfg, device)
+    output_dir = _resolve_output_dir(cfg, checkpoint_path)
+    cfg.logging.dir = str(output_dir)
     print(f"Loaded checkpoint: {checkpoint_path}")
+    print(f"Saving eval outputs to: {output_dir}")
     print(
-        "Policy inference steps from checkpoint: "
-        f"{checkpoint_cfg['eval']['num_inference_steps']}"
+        "Policy inference steps: "
+        f"{_resolve_inference_steps(cfg) or checkpoint_cfg['eval']['num_inference_steps']}"
     )
 
     loaders = {

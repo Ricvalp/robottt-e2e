@@ -58,6 +58,7 @@ def sample_quickdraw_tokens_encoder_decoder(
     demos: Dict[str, torch.Tensor],
     *,
     generator: Optional[torch.Generator] = None,
+    inference_steps: Optional[int] = None,
 ) -> torch.Tensor:
     """Autoregressively sample `max_tokens` conditioned on full context (no observed query)."""
 
@@ -94,6 +95,7 @@ def sample_quickdraw_tokens_encoder_decoder(
             history=history,
             history_mask=history_mask,
             generator=generator,
+            inference_steps=inference_steps,
         )
         samples.append(actions)
 
@@ -115,6 +117,7 @@ def sample_quickdraw_tokens_encoder_decoder_from_partial(
     demos: Dict[str, torch.Tensor],
     *,
     generator: Optional[torch.Generator] = None,
+    inference_steps: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Sample conditioned on context plus a provided history prefix (from MAML query batches).
@@ -147,6 +150,7 @@ def sample_quickdraw_tokens_encoder_decoder_from_partial(
             history=history,
             history_mask=history_mask,
             generator=generator,
+            inference_steps=inference_steps,
         )
         samples.append(actions)
 
@@ -273,49 +277,79 @@ def _plot_tokens(ax, tokens: torch.Tensor, title: str, coordinate_mode: str) -> 
     ax.axis("off")
 
 
-def log_qualitative_samples(
+def _resolve_max_tokens(cfg, max_tokens: Optional[int]) -> int:
+    if max_tokens is not None:
+        return int(max_tokens)
+    data_cfg = getattr(cfg, "data", None)
+    if data_cfg is not None and hasattr(data_cfg, "max_query_len"):
+        return int(getattr(data_cfg, "max_query_len"))
+    if data_cfg is not None and hasattr(data_cfg, "max_seq_len"):
+        return int(getattr(data_cfg, "max_seq_len"))
+    raise ValueError("Unable to resolve max_tokens for qualitative sampling.")
+
+
+def _resolve_num_context_demos(cfg, num_context_demos: Optional[int]) -> int:
+    if num_context_demos is not None:
+        return int(num_context_demos)
+    data_cfg = getattr(cfg, "data", None)
+    if data_cfg is not None and hasattr(data_cfg, "K"):
+        value = int(getattr(data_cfg, "K"))
+        if value > 0:
+            return value
+    raise ValueError("Unable to resolve the number of context demos for plotting.")
+
+
+def build_qualitative_sample_images(
     policy: torch.nn.Module,
     context: Dict[str, torch.Tensor],
     *,
-    split: str,
     cfg,
     step: int,
     device: torch.device,
     use_partial_history: bool = False,
-) -> None:
-    """
-    Sample sketches and push them to WandB for visual inspection.
-    Works for both full-context (no observed query) and partial-history (MAML) cases.
-    """
+    generator: Optional[torch.Generator] = None,
+    max_tokens: Optional[int] = None,
+    num_context_demos: Optional[int] = None,
+) -> List[object]:
+    """Render sampled sketches as WandB images without logging them."""
     if (not cfg.wandb.use) or cfg.wandb.project is None or cfg.eval.samples <= 0:
-        return
+        return []
 
-    # lazy imports to keep training light if wandb/mpl not installed
     import wandb  # type: ignore
     import matplotlib.pyplot as plt  # type: ignore
 
     prev_mode = policy.training
     policy.eval()
 
-    generator = torch.Generator(device=device)
-    generator.manual_seed(cfg.eval.seed + step)
+    if generator is None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(cfg.eval.seed + step)
 
-    sampler = sample_quickdraw_tokens_encoder_decoder_from_partial if use_partial_history else sample_quickdraw_tokens_encoder_decoder
+    sampler = (
+        sample_quickdraw_tokens_encoder_decoder_from_partial
+        if use_partial_history
+        else sample_quickdraw_tokens_encoder_decoder
+    )
 
     samples = sampler(
         policy=policy,
-        max_tokens=cfg.data.max_query_len,
+        max_tokens=_resolve_max_tokens(cfg, max_tokens),
         demos=context,
         generator=generator,
     )
 
+    resolved_num_context_demos = _resolve_num_context_demos(cfg, num_context_demos)
     images = []
     batch_size = len(samples)
     for idx in range(batch_size):
         ctx_tokens = context["context"][idx]
         ctx_mask = context["context_mask"][idx]
         valid_ctx = ctx_tokens[ctx_mask].detach().cpu()
-        prompts = _split_context_prompts(valid_ctx, cfg.data.coordinate_mode, cfg.data.K)
+        prompts = _split_context_prompts(
+            valid_ctx,
+            cfg.data.coordinate_mode,
+            resolved_num_context_demos,
+        )
         sample_tokens = samples[idx]
 
         total_plots = len(prompts) + 1
@@ -347,11 +381,40 @@ def log_qualitative_samples(
         images.append(wandb.Image(fig, caption=f"step {step + 1} sample {idx}"))
         plt.close(fig)
 
-    if images:
-        wandb.log({f"samples/sketches/{split}": images}, step=step + 1)
-
     if prev_mode:
         policy.train()
+    return images
+
+
+def log_qualitative_samples(
+    policy: torch.nn.Module,
+    context: Dict[str, torch.Tensor],
+    *,
+    split: str,
+    cfg,
+    step: int,
+    device: torch.device,
+    use_partial_history: bool = False,
+) -> None:
+    """
+    Sample sketches and push them to WandB for visual inspection.
+    Works for both full-context (no observed query) and partial-history (MAML) cases.
+    """
+    if (not cfg.wandb.use) or cfg.wandb.project is None or cfg.eval.samples <= 0:
+        return
+
+    import wandb  # type: ignore
+
+    images = build_qualitative_sample_images(
+        policy,
+        context,
+        cfg=cfg,
+        step=step,
+        device=device,
+        use_partial_history=use_partial_history,
+    )
+    if images:
+        wandb.log({f"samples/sketches/{split}": images}, step=step + 1)
 
 
 __all__ = [
@@ -361,5 +424,6 @@ __all__ = [
     "sample_quickdraw_tokens_decoder_only",
     "clean_sketches_decoder_only",
     "clean_sketches_encoder_decoder",
+    "build_qualitative_sample_images",
     "log_qualitative_samples",
 ]

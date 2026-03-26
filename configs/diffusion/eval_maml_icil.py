@@ -34,11 +34,8 @@ def get_config() -> ConfigDict:
     cfg.data = ConfigDict()
     cfg.data.root = cache_root
     cfg.data.backend = "lmdb"
-    cfg.data.K = 4
-    cfg.data.max_seq_len = 480
-    cfg.data.max_query_len = 60
-    cfg.data.max_context_len = 400
-    cfg.data.coordinate_mode = "absolute"
+    cfg.data.max_seq_len = 0
+    cfg.data.coordinate_mode = ""
     cfg.data.index_dir = os.path.join(index_root, "faiss_index")
     cfg.data.ids_dir = os.path.join(index_root, "ids_family")
     cfg.data.families_cache_path = "all_families.txt"
@@ -51,15 +48,14 @@ def get_config() -> ConfigDict:
     cfg.checkpoint.path = ""
     cfg.checkpoint.run_name = ""
     cfg.checkpoint.epoch = 0
-    cfg.checkpoint.latest_filename = "latest.pt"
 
     cfg.eval = ConfigDict()
     cfg.eval.tasks = ("empty_sketches", "partial_sketches", "many_samples", "fid")
-    cfg.eval.samples = 256
+    cfg.eval.samples = 8
     cfg.eval.seed = 42
     cfg.eval.qualitative_split = "val"
-    cfg.eval.partial_prefix_fraction = 0.5
     cfg.eval.num_many_samples = 16
+    cfg.eval.max_tokens = 0
     cfg.eval.inference_steps = 0
 
     cfg.eval.fid = ConfigDict()

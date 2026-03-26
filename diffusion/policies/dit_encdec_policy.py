@@ -295,6 +295,7 @@ class DiTEncDecDiffusionPolicy(nn.Module):
         history: torch.Tensor,
         history_mask: torch.Tensor,
         generator: Optional[torch.Generator] = None,
+        inference_steps: Optional[int] = None,
     ) -> torch.Tensor:
         """Run the reverse diffusion process to synthesize a horizon chunk.
 
@@ -304,6 +305,8 @@ class DiTEncDecDiffusionPolicy(nn.Module):
             history:
             history_mask:
             generator: Optional ``torch.Generator`` for deterministic sampling.
+            inference_steps: Optional override for the number of reverse-diffusion
+                denoising steps. When omitted, ``self.num_inference_steps`` is used.
 
         Returns:
             Tensor with shape ``(B, horizon, action_dim)`` containing the
@@ -326,7 +329,15 @@ class DiTEncDecDiffusionPolicy(nn.Module):
             context_tokens, key_padding_mask=~context_mask
         )
 
-        self.scheduler.set_timesteps(self.num_inference_steps, device=device)
+        num_inference_steps = (
+            self.num_inference_steps
+            if inference_steps is None
+            else int(inference_steps)
+        )
+        if num_inference_steps <= 0:
+            raise ValueError("inference_steps must be positive.")
+
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
 
         for timestep in self.scheduler.timesteps:
             timesteps = torch.full(
@@ -551,6 +562,7 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
         history: torch.Tensor,
         history_mask: torch.Tensor,
         generator: Optional[torch.Generator] = None,
+        inference_steps: Optional[int] = None,
     ) -> torch.Tensor:
         """Run the reverse diffusion process to synthesize a horizon chunk.
 
@@ -560,6 +572,8 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
             history:
             history_mask:
             generator: Optional ``torch.Generator`` for deterministic sampling.
+            inference_steps: Optional override for the number of reverse-diffusion
+                denoising steps. When omitted, ``self.num_inference_steps`` is used.
 
         Returns:
             Tensor with shape ``(B, horizon, action_dim)`` containing the
@@ -582,7 +596,15 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
             context_tokens, key_padding_mask=~context_mask
         )
 
-        self.scheduler.set_timesteps(self.num_inference_steps, device=device)
+        num_inference_steps = (
+            self.num_inference_steps
+            if inference_steps is None
+            else int(inference_steps)
+        )
+        if num_inference_steps <= 0:
+            raise ValueError("inference_steps must be positive.")
+
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
 
         for timestep in self.scheduler.timesteps:
             timesteps = torch.full(

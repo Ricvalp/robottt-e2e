@@ -1,0 +1,183 @@
+MAML FINETUNING RECIPE (Diffusion ICIL, Encoder–Decoder DiT)
+
+GOAL:
+Start from a pretrained diffusion policy and finetune it so that a few
+gradient steps on context demos (LOO) improve performance on a query.
+We meta-learn an initialization that is easy to adapt.
+
+--------------------------------------------------
+0) INITIALIZATION
+--------------------------------------------------
+
+- Load pretrained weights:
+
+- IMPORTANT: create a NEW optimizer for meta-learning:
+
+Reason:
+The objective has changed (now bilevel / meta-learning). Old Adam moments
+from pretraining are not aligned with this objective.
+
+
+--------------------------------------------------
+1) PARAMETER SPLIT (CRITICAL)
+--------------------------------------------------
+
+We split parameters into FAST (inner loop) and SLOW (outer loop).
+
+FAST PARAMS (adapted in inner loop):
+- Decoder LAST ~25% of blocks:
+    - FFN / MLP weights
+    - AdaLN / FiLM modulation MLPs
+    - Final decoder normalization / modulation MLP
+
+SLOW PARAMS (only outer loop):
+- Rest of decoder
+- Encoder (but let's keep it frozen initially, can unfreeze later)
+
+DO NOT update in inner loop:
+- Attention weights (encoder or decoder)
+- Input projections (point / state encoders)
+- Time embeddings / diffusion embeddings
+
+Reason:
+Updating attention or early layers destabilizes diffusion.
+MLP-style layers are much safer and sufficient for adaptation.
+
+--------------------------------------------------
+2) META-TASK CONSTRUCTION (LOO)
+--------------------------------------------------
+
+For each sampled task:
+
+- Sample:
+    K_maml = K_pretrain + 1 context demos
+    + 1 query episode
+
+- Inner loop (support):
+    Repeat for m LOO choices (start with m=2):
+        - Hold out demo i
+        - Condition on remaining K_pretrain demos
+        - Compute diffusion loss on held-out demo
+
+- Outer loop (query):
+    - Sample a subset of size K_pretrain from context demos
+    - Condition query on this subset
+    - Compute diffusion loss on query episode
+
+Reason:
+Keeps outer distribution aligned with pretraining initially.
+
+--------------------------------------------------
+3) INNER LOOP (FAST ADAPTATION)
+--------------------------------------------------
+
+- Steps: 1 (try 2 later)
+- LR: 3e-4 (reduce to 1e-4 if unstable)
+
+Procedure:
+    support_loss = mean over m LOO losses
+
+    grads = autograd.grad(
+        support_loss,
+        fast_params,
+        create_graph=True   # full MAML
+    )
+
+    fast_params = fast_params - inner_lr * grads
+
+Notes:
+- No optimizer state
+- Reset fast params for every task
+- Optionally reuse diffusion noise/timesteps within a task (lower variance)
+
+--------------------------------------------------
+4) OUTER LOOP (META UPDATE)
+--------------------------------------------------
+
+For each task:
+    - Run inner loop → adapted fast params
+    - Compute query loss with adapted params
+
+Aggregate:
+    meta_loss = mean(query_loss over tasks)
+
+Then:
+    meta_loss.backward()
+    clip_grad_norm_(model.parameters(), 1.0)
+    outer_opt.step()
+
+Note: there are two different averages we take, and they mean different things:
+    - Average over multiple LOO splits within the same task
+    - Average over multiple different tasks
+
+--------------------------------------------------
+5) TRAINING SETTINGS (GOOD DEFAULTS)
+--------------------------------------------------
+
+- outer batch size: 4–8 tasks
+- inner_steps: 1
+- inner_lr: 3e-4
+- outer_lr: 1e-5
+- weight_decay: 1e-4
+- grad_clip: 1.0
+
+- Run ~5–20% of pretraining compute
+
+--------------------------------------------------
+6) IMPORTANT PRACTICAL DETAILS
+--------------------------------------------------
+
+- Fast params are RESET every task (do not carry across tasks)
+- Outer optimizer persists across steps
+- Inner loop is stateless (no Adam, no momentum)
+- Keep diffusion loss IDENTICAL to pretraining
+- Ensure support and query use same preprocessing / masking
+
+--------------------------------------------------
+7) FIRST WORKING CONFIG (RECOMMENDED)
+--------------------------------------------------
+
+Start with:
+
+- fast params:
+    decoder last 25% FFN + AdaLN
+- encoder frozen
+- inner_steps = 1
+- LOO samples per task = 2
+- outer batch size = 4
+
+This is the most stable configuration.
+
+--------------------------------------------------
+8) IF STABLE, IMPROVE
+--------------------------------------------------
+
+Try progressively:
+
+- inner_steps = 2
+- increase LOO samples (m=4)
+- unfreeze encoder in outer loop
+- optionally include small encoder FFNs in fast params
+
+DO NOT:
+- add attention to fast params early
+- increase inner_steps aggressively
+
+--------------------------------------------------
+9) SUMMARY INTUITION
+--------------------------------------------------
+
+You are meta-learning an initialization such that:
+
+    "after 1–2 gradient steps on K demos,
+     the policy improves on a new query"
+
+Adaptation happens in a small, safe subspace (decoder MLPs),
+while the rest of the model provides stable structure.
+
+
+---------------------------------------------------
+---------------------------------------------------
+
+Regarding 5. we obviously change the to v_prediction (or whatever target was used during pretraining).
+Regarding 7. we will change max_context_len and max_seq_len to the larger context size so that we won't have too many resamples.

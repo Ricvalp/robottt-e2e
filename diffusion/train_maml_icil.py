@@ -25,7 +25,8 @@ The training loop below shows:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import copy
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Tuple, Optional
 from pathlib import Path
 from tqdm import tqdm
@@ -42,7 +43,7 @@ import wandb
 
 from dataset import QuickDrawEpisodesMAML, MAMLDiffusionCollator
 from diffusion.policies import MAMLDiTEncDecDiffusionPolicy, DiTEncDecDiffusionPolicyConfig
-from diffusion.sampling import log_qualitative_samples
+from diffusion.sampling import build_qualitative_sample_images
 from diffusion.utils import ProfilerGuard
 
 
@@ -156,6 +157,243 @@ def get_fast_param_names(
     return sorted(fast_names)
 
 
+def get_outer_param_names(
+    model: nn.Module,
+    *,
+    train_encoder: bool = False,
+    train_decoder: bool = True,
+    train_input_projections: bool = True,
+    train_output_head: bool = True,
+    train_diffusion_conditioning: bool = True,
+) -> List[str]:
+    """Return names of parameters updated by the outer optimizer."""
+    outer_prefixes: List[str] = []
+    if train_encoder:
+        outer_prefixes.append("encoder_transformer.")
+    if train_decoder:
+        outer_prefixes.append("decoder_transformer.")
+    if train_input_projections:
+        outer_prefixes.extend(
+            [
+                "point_feature_proj.",
+                "history_feature_proj.",
+                "action_encoder.",
+            ]
+        )
+    if train_output_head:
+        outer_prefixes.append("output_head.")
+    if train_diffusion_conditioning:
+        outer_prefixes.extend(
+            [
+                "diffusion_proj.",
+                "world_time_embedder.",
+                "diffusion_time_embedder.",
+            ]
+        )
+
+    outer_names = [
+        name
+        for name, _ in model.named_parameters()
+        if any(name.startswith(prefix) for prefix in outer_prefixes)
+    ]
+    if not outer_names:
+        raise RuntimeError("No outer-trainable parameters were selected.")
+    return sorted(outer_names)
+
+
+def _set_outer_trainable_params(
+    model: nn.Module,
+    outer_names: List[str],
+) -> None:
+    outer_name_set = set(outer_names)
+    for name, param in model.named_parameters():
+        param.requires_grad_(name in outer_name_set)
+
+
+def _count_params_by_name(model: nn.Module, names: List[str]) -> int:
+    name_set = set(names)
+    return sum(param.numel() for name, param in model.named_parameters() if name in name_set)
+
+
+def _load_checkpoint_for_finetuning(
+    ckpt_path: Path,
+    *,
+    device: torch.device,
+) -> Dict[str, Any]:
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Pretrained checkpoint not found: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Checkpoint at {ckpt_path} is not a dict.")
+    if "model" not in checkpoint:
+        raise KeyError(f"Checkpoint at {ckpt_path} does not contain a 'model' state dict.")
+    checkpoint_cfg = checkpoint.get("config")
+    if not isinstance(checkpoint_cfg, dict):
+        raise ValueError(
+            f"Checkpoint at {ckpt_path} does not contain a valid 'config' dict. "
+            "Expected a pretrain checkpoint produced by pretrain_encoder_decoder.py."
+        )
+    return checkpoint
+
+
+def _resolve_policy_config(
+    config: ConfigDict,
+    *,
+    pretrained_config: Optional[Dict[str, Any]] = None,
+) -> tuple[DiTEncDecDiffusionPolicyConfig, Dict[str, Any]]:
+    if pretrained_config is not None:
+        model_cfg = pretrained_config.get("model")
+        if not isinstance(model_cfg, dict):
+            raise ValueError("Pretrained checkpoint config is missing the 'model' section.")
+        eval_cfg = pretrained_config.get("eval", {})
+        if not isinstance(eval_cfg, dict):
+            eval_cfg = {}
+        source = "checkpoint"
+    else:
+        model_cfg = config.model.to_dict()
+        eval_cfg = config.eval.to_dict()
+        source = "config"
+
+    required_model_keys = (
+        "horizon",
+        "input_dim",
+        "output_dim",
+        "hidden_dim",
+        "num_layers",
+        "num_heads",
+        "mlp_dim",
+        "dropout",
+        "attention_dropout",
+        "prediction_type",
+        "num_train_timesteps",
+        "beta_start",
+        "beta_end",
+        "beta_schedule",
+    )
+    missing_keys = [key for key in required_model_keys if key not in model_cfg]
+    if missing_keys:
+        raise KeyError(
+            f"Missing model fields in {source} policy config: {missing_keys}"
+        )
+
+    num_inference_steps = int(config.eval.num_inference_steps)
+    if num_inference_steps <= 0:
+        num_inference_steps = int(eval_cfg.get("num_inference_steps", 50))
+    if num_inference_steps <= 0:
+        num_inference_steps = 50
+
+    resolved = {
+        "source": source,
+        "model": dict(model_cfg),
+        "num_inference_steps": num_inference_steps,
+    }
+    policy_cfg = DiTEncDecDiffusionPolicyConfig(
+        horizon=int(model_cfg["horizon"]),
+        point_feature_dim=int(model_cfg["input_dim"]),
+        action_dim=int(model_cfg["output_dim"]),
+        hidden_dim=int(model_cfg["hidden_dim"]),
+        num_layers=int(model_cfg["num_layers"]),
+        num_heads=int(model_cfg["num_heads"]),
+        mlp_dim=int(model_cfg["mlp_dim"]),
+        dropout=float(model_cfg["dropout"]),
+        attention_dropout=float(model_cfg["attention_dropout"]),
+        prediction_type=str(model_cfg["prediction_type"]),
+        num_inference_steps=num_inference_steps,
+        noise_scheduler_kwargs={
+            "num_train_timesteps": int(model_cfg["num_train_timesteps"]),
+            "beta_start": float(model_cfg["beta_start"]),
+            "beta_end": float(model_cfg["beta_end"]),
+            "beta_schedule": str(model_cfg["beta_schedule"]),
+        },
+    )
+    return policy_cfg, resolved
+
+
+def _resolve_outer_context_size(
+    *,
+    configured_size: int,
+    data_k: int,
+    pretrained_config: Optional[Dict[str, Any]] = None,
+) -> int:
+    if configured_size > 0:
+        resolved_size = configured_size
+    elif pretrained_config is not None:
+        data_cfg = pretrained_config.get("data")
+        if not isinstance(data_cfg, dict) or "K" not in data_cfg:
+            raise ValueError(
+                "Unable to infer K_pretrain from pretrained checkpoint config. "
+                "Set config.maml.outer_context_size explicitly."
+            )
+        resolved_size = int(data_cfg["K"])
+    else:
+        resolved_size = data_k
+
+    if resolved_size <= 0:
+        raise ValueError("outer_context_size must be positive.")
+    if resolved_size > data_k:
+        raise ValueError(
+            f"outer_context_size={resolved_size} exceeds resolved data.K={data_k}."
+        )
+    return resolved_size
+
+
+def _resolve_data_k(
+    config: ConfigDict,
+    *,
+    pretrained_config: Optional[Dict[str, Any]] = None,
+) -> int:
+    configured_k = int(config.data.K)
+    if configured_k > 0:
+        return configured_k
+    if pretrained_config is None:
+        raise ValueError(
+            "data.K=0 requires config.finetune.pretrained_checkpoint so K_maml can "
+            "be inferred as K_pretrain + 1."
+        )
+
+    data_cfg = pretrained_config.get("data")
+    if not isinstance(data_cfg, dict) or "K" not in data_cfg:
+        raise ValueError(
+            "Unable to infer K_pretrain from pretrained checkpoint config. "
+            "Set config.data.K explicitly."
+        )
+    pretrained_k = int(data_cfg["K"])
+    if pretrained_k <= 0:
+        raise ValueError(
+            f"Invalid K={pretrained_k} found in pretrained checkpoint config."
+        )
+    return pretrained_k + 1
+
+
+def _resolve_logging_max_tokens(
+    config: ConfigDict,
+    *,
+    pretrained_config: Optional[Dict[str, Any]] = None,
+) -> int:
+    if pretrained_config is not None:
+        data_cfg = pretrained_config.get("data")
+        if isinstance(data_cfg, dict):
+            max_query_len = data_cfg.get("max_query_len")
+            if max_query_len is not None and int(max_query_len) > 0:
+                return int(max_query_len)
+    return int(config.data.max_seq_len)
+
+
+class _NullCtx:
+    def __enter__(self): return None
+    def __exit__(self, exc_type, exc, tb): return False
+
+
+def _maml_attention_ctx(cfg: MAMLConfig, device: torch.device):
+    if cfg.use_math_attention and device.type == "cuda":
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=False,
+            enable_mem_efficient=False,
+            enable_math=True,
+        )
+    return _NullCtx()
+
+
 def _special_token(
     sep: float = 0.0,
     stop: float = 0.0,
@@ -167,65 +405,130 @@ def _special_token(
     return token
 
 
+def _pretrain_special_token(
+    sep: float = 0.0,
+    reset: float = 0.0,
+    stop: float = 0.0,
+) -> np.ndarray:
+    token = np.zeros(7, dtype=np.float32)
+    token[4] = sep
+    token[5] = reset
+    token[6] = stop
+    return token
+
+
+def _to_pretrain_token_space(sketch_tokens: np.ndarray) -> np.ndarray:
+    if sketch_tokens.ndim != 2 or sketch_tokens.shape[1] != 6:
+        raise ValueError(
+            f"Expected sketch tokens with shape (T, 6), got {tuple(sketch_tokens.shape)}."
+        )
+    expanded = np.zeros((sketch_tokens.shape[0], 7), dtype=np.float32)
+    expanded[:, :5] = sketch_tokens[:, :5]
+    expanded[:, 6] = sketch_tokens[:, 5]
+    return expanded
+
+
+def _compose_pretrain_style_episode(
+    prompt_episodes: List[np.ndarray],
+    query_episode: np.ndarray,
+) -> np.ndarray:
+    segments: List[np.ndarray] = [_pretrain_special_token(sep=1.0)]
+    for sketch in prompt_episodes:
+        segments.append(_to_pretrain_token_space(sketch))
+        segments.append(_pretrain_special_token(sep=1.0))
+    segments.append(_pretrain_special_token(reset=1.0))
+    segments.append(_pretrain_special_token(sep=1.0))
+    segments.append(_to_pretrain_token_space(query_episode))
+    segments.append(_pretrain_special_token(stop=1.0))
+    return np.vstack(segments).astype(dtype=np.float32, copy=False)
+
+
+def _prepare_pretrain_style_batch(
+    episode_tokens: np.ndarray,
+    *,
+    horizon: int,
+    rng: torch.Generator,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    tokens = torch.from_numpy(episode_tokens).to(device=device, dtype=torch.float32)
+    reset_idx = (tokens[:, 5] == 1.0).nonzero(as_tuple=True)[0]
+    if reset_idx.numel() != 1:
+        raise ValueError(
+            f"Expected exactly one reset token in pseudo-episode, found {reset_idx.numel()}."
+        )
+    reset_idx = int(reset_idx.item())
+    start_idx = int(
+        torch.randint(
+            low=reset_idx + 1,
+            high=tokens.shape[0],
+            size=(1,),
+            generator=rng,
+            device=device,
+        ).item()
+    )
+
+    tokens = torch.cat([tokens[:, :5], tokens[:, 6:]], dim=-1)
+
+    context = tokens[:reset_idx].clone()
+    points = tokens[reset_idx + 1 : start_idx + 1].clone()
+    actions = tokens[start_idx + 1 : start_idx + 1 + horizon].clone()
+    if actions.shape[0] < horizon:
+        actions = _pad_actions(actions, horizon=horizon)
+
+    query_len = points.shape[0] + actions.shape[0]
+    points_len = points.shape[0]
+    context_len = context.shape[0]
+    feature_dim = tokens.shape[-1]
+
+    history = torch.zeros((1, query_len, feature_dim), dtype=torch.float32, device=device)
+    context_batch = torch.zeros((1, context_len, feature_dim), dtype=torch.float32, device=device)
+    actions_batch = actions.unsqueeze(0).to(device=device, dtype=torch.float32)
+    query_mask = torch.zeros((1, query_len + horizon), dtype=torch.bool, device=device)
+    context_mask = torch.zeros((1, context_len), dtype=torch.bool, device=device)
+
+    history[0, -points_len:] = points
+    context_batch[0, -context_len:] = context
+    query_mask[0, -query_len:] = True
+    context_mask[0, -context_len:] = True
+
+    return {
+        "history": history,
+        "actions": actions_batch,
+        "context": context_batch,
+        "query_mask": query_mask,
+        "context_mask": context_mask,
+    }
+
+
 def _pad_actions(actions: torch.Tensor, horizon: int) -> torch.Tensor:
     """Pads actions that are shorter than the horizon with end-tokens."""
     pad_len = horizon - actions.shape[0]
-    padding = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]]).tile((pad_len, 1))
+    padding = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]],
+        dtype=actions.dtype,
+        device=actions.device,
+    ).tile((pad_len, 1))
 
     return torch.cat([actions, padding])
 
 
-def _prepare_loo_episode(heldout: np.ndarray, kept: np.ndarray, horizon: int, rng: np.random.Generator, device: torch.device):
-    
-    segments: List[np.ndarray] = [_special_token(sep=1.0)]  # Dummy start
-    for sketch in kept:
-        segments.append(sketch)
-        segments.append(_special_token(sep=1.0))
-    context_tokens = np.vstack(segments).astype(dtype=np.float32, copy=False)
-    context_tokens = torch.from_numpy(context_tokens)
-    
-    segments: List[np.ndarray] = [_special_token(sep=1.0)]  # Dummy start
-    segments.append(heldout)
-    segments.append(_special_token(stop=1.0))
-    query_tokens = np.vstack(segments).astype(dtype=np.float32, copy=False)
-    query_tokens = torch.from_numpy(query_tokens)
-    
-    max_start = max(2, query_tokens.shape[0] - 1)          # exclude stop
-    max_start = max(2, min(max_start, query_tokens.shape[0] - horizon))  # leave room
-
-    start_idx = torch.randint(
-        low=1,
-        high=max_start,
-        size=(1,),
-        generator=rng,
+def _prepare_loo_episode(
+    heldout: np.ndarray,
+    kept: np.ndarray,
+    horizon: int,
+    rng: torch.Generator,
+    device: torch.device,
+):
+    episode_tokens = _compose_pretrain_style_episode(
+        prompt_episodes=list(kept),
+        query_episode=heldout,
+    )
+    return _prepare_pretrain_style_batch(
+        episode_tokens,
+        horizon=horizon,
+        rng=rng,
         device=device,
-        ).item()
-
-    points = query_tokens[1 : start_idx + 1].clone()
-    actions = query_tokens[start_idx + 1 : start_idx + 1 + horizon].clone()
-    
-    context_mask = torch.ones(context_tokens.shape[0], dtype=torch.bool, device=device)
-    query_mask = torch.ones(points.shape[0] + horizon, dtype=torch.bool, device=device)
-    
-
-    if actions.shape[0] < horizon:
-        actions = _pad_actions(actions, horizon=horizon)
-        
-        
-    # Add batch dim
-    points = points.unsqueeze(0)
-    actions = actions.unsqueeze(0)
-    context_tokens = context_tokens.unsqueeze(0)
-    query_mask = query_mask.unsqueeze(0)
-    context_mask = context_mask.unsqueeze(0)
-
-    return {
-        "history": points.to(device=device, dtype=torch.float32),
-        "actions": actions.to(device=device, dtype=torch.float32),
-        "context": context_tokens.to(device=device, dtype=torch.float32),
-        "query_mask": query_mask,
-        "context_mask": context_mask,
-    }
+    )
 
 
 def build_support_batch_loo(
@@ -248,14 +551,8 @@ def build_support_batch_loo(
       task["query_episode"]:   Tensor[T_q, F]          (unused here)
 
     Returns a dict compatible with DiTEncDecDiffusionPolicy.compute_loss(), with batch size 1.
-
-    Notes on shapes (matching your previous collator conventions):
-      - history is allocated with length = (points_len + horizon) and we right-align points
-        leaving an extra prefix of length horizon as zeros.
-      - query_mask has length = history_len + horizon and marks the last (points_len + horizon)
-        positions as True (same as your old collator).
-      - context is the concatenation of all context episodes except the held-out one
-        (optionally inserting a SEP token between episodes).
+    The held-out sketch is wrapped into the exact same pseudo-episode structure
+    used in pretraining before splitting into context/history/actions.
     """
     if horizon <= 0:
         raise ValueError("horizon must be positive.")
@@ -372,6 +669,30 @@ def _concat_context_episodes(
     return context, context_mask
 
 
+def _sample_context_subset(
+    context_episodes: List[np.ndarray],
+    *,
+    num_context_episodes: Optional[int],
+    rng: torch.Generator,
+    device: torch.device,
+) -> List[np.ndarray]:
+    if num_context_episodes is None or num_context_episodes >= len(context_episodes):
+        return context_episodes
+    if num_context_episodes <= 0:
+        raise ValueError("num_context_episodes must be positive when provided.")
+    if num_context_episodes > len(context_episodes):
+        raise ValueError(
+            f"Requested {num_context_episodes} context episodes but task only has "
+            f"{len(context_episodes)}."
+        )
+
+    keep_indices = torch.randperm(
+        len(context_episodes), generator=rng, device=device
+    )[:num_context_episodes]
+    keep_indices = sorted(int(idx) for idx in keep_indices.tolist())
+    return [context_episodes[idx] for idx in keep_indices]
+
+
 def build_query_batch(
     task: Dict[str, List[np.ndarray]],
     *,
@@ -382,31 +703,15 @@ def build_query_batch(
     # Optional knobs (safe defaults)
     rng: Optional[torch.Generator] = None,
     add_sep_between_context_episodes: bool = True,
+    num_context_episodes: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Build the query batch dict (condition on all K context episodes, target is query episode).
-    Same shape contract as build_support_batch_loo.
+    Build the query batch dict for the query episode using the exact same
+    pseudo-episode structure as pretraining.
 
     Expected task format:
       task["context_episodes"]: List[Tensor[T_i, F]]  length K
       task["query_episode"]:   Tensor[T_q, F]
-
-    Output dict (batch size 1):
-      {
-        "context":      (1, C_len, F),
-        "context_mask": (1, C_len) bool,
-        "history":      (1, H, F),           # H = observed history length (no extra prefix)
-        "actions":      (1, horizon, F),     # padded to horizon
-        "query_mask":   (1, H + horizon) bool (history valid + action_valid),
-        optional: "noise": (1, horizon, F), "timesteps": (1,)
-      }
-
-    Notes:
-    - This chooses a random split point start_idx in the query episode:
-        history = query[:start_idx+1]
-        actions = query[start_idx+1 : start_idx+1+horizon] (padded)
-    - If you prefer a deterministic split (e.g., always last horizon tokens),
-      change the start_idx logic.
     """
     if horizon <= 0:
         raise ValueError("horizon must be positive.")
@@ -414,59 +719,36 @@ def build_query_batch(
     context_episodes: List[np.ndarray] = task["context_episodes"]
     query_ep: np.ndarray = task["query_episode"]
 
-    # 1) Build concatenated context sequence
-    context, context_mask = _concat_context_episodes(
-        context_episodes,
-        device=device,
-        add_sep_between_episodes=add_sep_between_context_episodes,
-    )
-
-    # 2) Split query episode into history + actions
-    if query_ep.ndim != 2:
-        raise ValueError(f"query_episode must be (T,F), got {tuple(query_ep.shape)}")
-
-    query_ep = torch.from_numpy(query_ep).to(device=device, dtype=torch.float32)
-
-    Tq, F = query_ep.shape
-    if Tq < 1:
-        raise ValueError("query_episode is empty.")
-
     if rng is None:
         rng = torch.Generator(device=device)
         rng.manual_seed(torch.seed())
 
-    # choose start_idx in [0, Tq-1] => history has at least 1 token
-    start_idx = int(torch.randint(0, Tq, (1,), generator=rng, device=device).item())
-
-    history_1d = query_ep[: start_idx + 1].clone()  # (H, F)
-    actions_1d = query_ep[start_idx + 1 : start_idx + 1 + horizon].clone()  # (<=horizon, F)
-
-    actions_pad, action_valid = _pad_actions_to_horizon(actions_1d, horizon)
-
-    history = history_1d.unsqueeze(0)      # (1, H, F)
-    actions = actions_pad.unsqueeze(0)     # (1, horizon, F)
-
-    H = history.shape[1]
-    query_mask = torch.ones((1, H + horizon), dtype=torch.bool, device=device)
-    
-    # query_mask = torch.zeros((1, H + horizon), dtype=torch.bool, device=device)
-    # query_mask[0, :H] = True
-    # query_mask[0, H:] = action_valid  # mask out padded tail if any
-
-    out: Dict[str, torch.Tensor] = {
-        "context": context,
-        "context_mask": context_mask,
-        "history": history,
-        "actions": actions,
-        "query_mask": query_mask,
-    }
+    selected_context_episodes = _sample_context_subset(
+        context_episodes,
+        num_context_episodes=num_context_episodes,
+        rng=rng,
+        device=device,
+    )
+    episode_tokens = _compose_pretrain_style_episode(
+        prompt_episodes=selected_context_episodes,
+        query_episode=query_ep,
+    )
+    out = _prepare_pretrain_style_batch(
+        episode_tokens,
+        horizon=horizon,
+        rng=rng,
+        device=device,
+    )
 
     # 3) Optional diffusion variance control
     if noise is not None:
         if noise.ndim == 2:
             noise = noise.unsqueeze(0)
-        if noise.shape != actions.shape:
-            raise ValueError(f"noise shape {tuple(noise.shape)} must match actions shape {tuple(actions.shape)}")
+        if noise.shape != out["actions"].shape:
+            raise ValueError(
+                f"noise shape {tuple(noise.shape)} must match actions shape "
+                f"{tuple(out['actions'].shape)}"
+            )
         out["noise"] = noise.to(device=device, dtype=torch.float32)
 
     if timesteps is not None:
@@ -493,7 +775,9 @@ class MAMLConfig:
     max_grad_norm: float = 1.0
     last_frac_fast: float = 0.25
     include_ada_fast: bool = True
+    include_final_norm_fast: bool = True
     num_loo_per_task: int = 2        # how many held-out context eps per inner step (subsample if K large)
+    outer_context_size: int = 0
     reuse_diffusion_noise: bool = True  # reuse noise/timesteps across inner steps + query (lower variance)
     use_math_attention: bool = True
     device: str = "cuda"
@@ -513,6 +797,104 @@ def _clip_grads_in_list(grads: List[torch.Tensor], max_norm: float) -> List[torc
     return [g * scale if g is not None else None for g in grads]
 
 
+def _sample_loo_indices(
+    K: int,
+    *,
+    num_loo_per_task: int,
+    device: torch.device,
+    rng: Optional[torch.Generator] = None,
+) -> List[int]:
+    if num_loo_per_task >= K:
+        return list(range(K))
+    perm = torch.randperm(K, generator=rng, device=device)
+    return perm[:num_loo_per_task].tolist()
+
+
+def _adapt_fast_params_for_task(
+    model: nn.Module,
+    task: Dict[str, Any],
+    *,
+    fast_names: List[str],
+    cfg: MAMLConfig,
+    horizon: int,
+    create_graph: bool,
+    rng: Optional[torch.Generator] = None,
+) -> tuple[Dict[str, torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    device = torch.device(cfg.device)
+    params = {k: v for k, v in model.named_parameters()}
+    buffers = {k: v for k, v in model.named_buffers()}
+
+    shared_noise = None
+    shared_timesteps = None
+    adapted_params = params
+    K = len(task["context_episodes"])
+    loo_indices = _sample_loo_indices(
+        K,
+        num_loo_per_task=cfg.num_loo_per_task,
+        device=device,
+        rng=rng,
+    )
+
+    for _ in range(cfg.inner_steps):
+        support_losses: List[torch.Tensor] = []
+        for i in loo_indices:
+            support_batch = build_support_batch_loo(
+                task,
+                holdout_idx=i,
+                horizon=horizon,
+                device=device,
+                noise=shared_noise if cfg.reuse_diffusion_noise else None,
+                timesteps=shared_timesteps if cfg.reuse_diffusion_noise else None,
+                rng=rng,
+            )
+
+            if cfg.reuse_diffusion_noise and (shared_noise is None or shared_timesteps is None):
+                shared_noise = torch.randn_like(support_batch["actions"])
+                shared_timesteps = torch.randint(
+                    0,
+                    model.scheduler.config.num_train_timesteps,
+                    (support_batch["actions"].shape[0],),
+                    device=device,
+                    dtype=torch.long,
+                )
+                support_batch["noise"] = shared_noise
+                support_batch["timesteps"] = shared_timesteps
+
+            loss_s = functional_call(model, (adapted_params, buffers), (support_batch,))
+            support_losses.append(loss_s)
+
+        support_loss = torch.stack(support_losses).mean()
+        fast_tensors = [adapted_params[n] for n in fast_names]
+        grads = torch.autograd.grad(
+            support_loss,
+            fast_tensors,
+            create_graph=create_graph,
+            retain_graph=create_graph,
+            allow_unused=False,
+        )
+        grads = _clip_grads_in_list(list(grads), cfg.max_grad_norm)
+
+        new_params = dict(adapted_params)
+        for name, p, g in zip(fast_names, fast_tensors, grads):
+            new_params[name] = p - cfg.inner_lr * g
+        adapted_params = new_params
+
+    return adapted_params, shared_noise, shared_timesteps
+
+
+def _copy_fast_params_into_model(
+    target_model: nn.Module,
+    *,
+    adapted_params: Dict[str, torch.Tensor],
+    fast_names: List[str],
+) -> None:
+    fast_name_set = set(fast_names)
+    with torch.no_grad():
+        for name, param in target_model.named_parameters():
+            if name in fast_name_set:
+                param.copy_(adapted_params[name].detach())
+
+
 def maml_task_loss_second_order(
     model: nn.Module,
     task: Dict[str, Any],
@@ -528,75 +910,15 @@ def maml_task_loss_second_order(
     Returns scalar loss (requires grad).
     """
     device = torch.device(cfg.device)
-
-    # Grab params/buffers (stateless execution)
-    params = {k: v for k, v in model.named_parameters()}
     buffers = {k: v for k, v in model.named_buffers()}
-
-    # Shared diffusion randomness for stability (sample lazily from first built batch)
-    shared_noise = None
-    shared_timesteps = None
-
-    # Inner loop: update only fast params
-    adapted_params = params
-    K = len(task["context_episodes"])
-
-    # Choose which indices to hold out (subsample for speed)
-    if cfg.num_loo_per_task >= K:
-        loo_indices = list(range(K))
-    else:
-        perm = torch.randperm(K, device=device)
-        loo_indices = perm[: cfg.num_loo_per_task].tolist()
-
-    for _step in range(cfg.inner_steps):
-        support_losses: List[torch.Tensor] = []
-
-        for i in loo_indices:
-            # Build batch; if shared_noise/shared_timesteps exist, pass them in.
-            # Otherwise build without them, then lazily sample and inject.
-            support_batch = build_support_batch_loo(
-                task,
-                holdout_idx=i,
-                horizon=horizon,
-                device=device,
-                noise=shared_noise if cfg.reuse_diffusion_noise else None,
-                timesteps=shared_timesteps if cfg.reuse_diffusion_noise else None,
-            )
-
-            if cfg.reuse_diffusion_noise and (shared_noise is None or shared_timesteps is None):
-                # Lazily sample from correct shape/dtype/device
-                shared_noise = torch.randn_like(support_batch["actions"])
-                shared_timesteps = torch.randint(
-                    0,
-                    model.scheduler.config.num_train_timesteps,
-                    (support_batch["actions"].shape[0],),  # batch size (likely 1)
-                    device=device,
-                    dtype=torch.long,
-                )
-                # Inject into already-built batch dict (no rebuild)
-                support_batch["noise"] = shared_noise
-                support_batch["timesteps"] = shared_timesteps
-
-            loss_s = functional_call(model, (adapted_params, buffers), (support_batch,))
-            support_losses.append(loss_s)
-
-        support_loss = torch.stack(support_losses).mean()
-
-        fast_tensors = [adapted_params[n] for n in fast_names]
-        grads = torch.autograd.grad(
-            support_loss,
-            fast_tensors,
-            create_graph=True,   # <-- full MAML (grad-of-grad)
-            retain_graph=True,
-            allow_unused=False,
-        )
-        grads = list(grads)
-        grads = _clip_grads_in_list(grads, cfg.max_grad_norm)
-
-        new_params = dict(adapted_params)
-        for name, p, g in zip(fast_names, fast_tensors, grads):
-            new_params[name] = p - cfg.inner_lr * g
-        adapted_params = new_params
+    adapted_params, shared_noise, shared_timesteps = _adapt_fast_params_for_task(
+        model,
+        task,
+        fast_names=fast_names,
+        cfg=cfg,
+        horizon=horizon,
+        create_graph=True,
+    )
 
     # Outer: query loss evaluated with adapted fast params
     query_batch = build_query_batch(
@@ -605,6 +927,7 @@ def maml_task_loss_second_order(
         device=device,
         noise=shared_noise if cfg.reuse_diffusion_noise else None,
         timesteps=shared_timesteps if cfg.reuse_diffusion_noise else None,
+        num_context_episodes=cfg.outer_context_size,
     )
 
     # If query_batch builder didn't inject (e.g., you rely on passing), inject here too.
@@ -615,6 +938,132 @@ def maml_task_loss_second_order(
 
     query_loss = functional_call(model, (adapted_params, buffers), (query_batch,))
     return query_loss
+
+
+def _log_maml_eval_samples(
+    policy: nn.Module,
+    eval_tasks: List[Dict[str, Any]],
+    *,
+    fast_names: List[str],
+    cfg: MAMLConfig,
+    config: ConfigDict,
+    policy_cfg: DiTEncDecDiffusionPolicyConfig,
+    device: torch.device,
+    step: int,
+    max_tokens: int,
+) -> None:
+    if not eval_tasks or not config.wandb.use or wandb.run is None or config.eval.samples <= 0:
+        return
+
+    num_log_tasks = min(len(eval_tasks), int(config.eval.samples))
+    adapted_policy = copy.deepcopy(policy).to(device)
+    adapted_policy.eval()
+    for param in adapted_policy.parameters():
+        param.requires_grad_(False)
+
+    images = []
+    for task_idx, task in enumerate(eval_tasks[:num_log_tasks]):
+        task_seed = int(config.eval.seed) + step * 10_000 + task_idx
+        task_rng = torch.Generator(device=device)
+        task_rng.manual_seed(task_seed)
+
+        with _maml_attention_ctx(cfg, device), torch.enable_grad():
+            adapted_params, _, _ = _adapt_fast_params_for_task(
+                policy,
+                task,
+                fast_names=fast_names,
+                cfg=cfg,
+                horizon=policy_cfg.horizon,
+                create_graph=False,
+                rng=task_rng,
+            )
+
+        _copy_fast_params_into_model(
+            adapted_policy,
+            adapted_params=adapted_params,
+            fast_names=fast_names,
+        )
+
+        query_batch = build_query_batch(
+            task=task,
+            horizon=policy_cfg.horizon,
+            device=device,
+            rng=task_rng,
+            num_context_episodes=cfg.outer_context_size,
+        )
+        sample_generator = torch.Generator(device=device)
+        sample_generator.manual_seed(task_seed)
+        images.extend(
+            build_qualitative_sample_images(
+                adapted_policy,
+                query_batch,
+                cfg=config,
+                step=step,
+                device=device,
+                use_partial_history=False, # True,
+                generator=sample_generator,
+                max_tokens=max_tokens,
+                num_context_demos=cfg.outer_context_size,
+            )
+        )
+
+    if images:
+        wandb.log({"samples/sketches/eval": images}, step=step + 1)
+
+
+def _log_initial_eval_samples(
+    policy: nn.Module,
+    eval_tasks: List[Dict[str, Any]],
+    *,
+    config: ConfigDict,
+    policy_cfg: DiTEncDecDiffusionPolicyConfig,
+    device: torch.device,
+    step: int,
+    max_tokens: int,
+    num_context_demos: int,
+) -> None:
+    if not eval_tasks or not config.wandb.use or wandb.run is None or config.eval.samples <= 0:
+        return
+
+    num_log_tasks = min(len(eval_tasks), int(config.eval.samples))
+    was_training = policy.training
+    policy.eval()
+
+    images = []
+    with torch.no_grad():
+        for task_idx, task in enumerate(eval_tasks[:num_log_tasks]):
+            task_seed = int(config.eval.seed) + step * 10_000 + task_idx
+            task_rng = torch.Generator(device=device)
+            task_rng.manual_seed(task_seed)
+
+            query_batch = build_query_batch(
+                task=task,
+                horizon=policy_cfg.horizon,
+                device=device,
+                rng=task_rng,
+                num_context_episodes=num_context_demos,
+            )
+            sample_generator = torch.Generator(device=device)
+            sample_generator.manual_seed(task_seed)
+            images.extend(
+                build_qualitative_sample_images(
+                    policy,
+                    query_batch,
+                    cfg=config,
+                    step=step,
+                    device=device,
+                    use_partial_history=False, # True,
+                    generator=sample_generator,
+                    max_tokens=max_tokens,
+                    num_context_demos=num_context_demos,
+                )
+            )
+
+    if was_training:
+        policy.train()
+
+    if images:
+        wandb.log({"samples/sketches/eval_no_adaptation": images}, step=step)
 
 
 def maml_step(
@@ -658,6 +1107,57 @@ def load_config(config_flag) -> ConfigDict:
 def main(argv: List[str] | None = None) -> None:
     del argv
     config = load_config(_CONFIG)
+    device = torch.device(
+        config.run.device if torch.cuda.is_available() or config.run.device == "cpu" else "cpu"
+    )
+
+    pretrained_ckpt_path = None
+    pretrained_checkpoint = None
+    pretrained_config = None
+    pretrained_checkpoint_value = str(config.finetune.pretrained_checkpoint).strip()
+    if pretrained_checkpoint_value:
+        pretrained_ckpt_path = Path(pretrained_checkpoint_value).expanduser()
+        pretrained_checkpoint = _load_checkpoint_for_finetuning(
+            pretrained_ckpt_path,
+            device=device,
+        )
+        pretrained_config = pretrained_checkpoint["config"]
+        checkpoint_data_cfg = pretrained_config.get("data", {})
+        if isinstance(checkpoint_data_cfg, dict):
+            checkpoint_coordinate_mode = checkpoint_data_cfg.get("coordinate_mode")
+            if (
+                checkpoint_coordinate_mode is not None
+                and checkpoint_coordinate_mode != config.data.coordinate_mode
+            ):
+                raise ValueError(
+                    "coordinate_mode mismatch between pretrained checkpoint "
+                    f"('{checkpoint_coordinate_mode}') and current MAML config "
+                    f"('{config.data.coordinate_mode}')."
+                )
+
+    policy_cfg, resolved_policy = _resolve_policy_config(
+        config,
+        pretrained_config=pretrained_config,
+    )
+    initial_global_step = (
+        int(pretrained_checkpoint.get("step", 0))
+        if pretrained_checkpoint is not None
+        else 0
+    )
+    resolved_data_k = _resolve_data_k(
+        config,
+        pretrained_config=pretrained_config,
+    )
+    resolved_logging_max_tokens = _resolve_logging_max_tokens(
+        config,
+        pretrained_config=pretrained_config,
+    )
+    outer_context_size = _resolve_outer_context_size(
+        configured_size=int(config.maml.outer_context_size),
+        data_k=resolved_data_k,
+        pretrained_config=pretrained_config,
+    )
+
     cfg = MAMLConfig(
         inner_steps=config.maml.inner_steps,
         inner_lr=config.maml.inner_lr,
@@ -666,23 +1166,21 @@ def main(argv: List[str] | None = None) -> None:
         max_grad_norm=config.maml.max_grad_norm,
         last_frac_fast=config.maml.last_frac_fast,
         include_ada_fast=config.maml.include_ada_fast,
+        include_final_norm_fast=config.maml.include_final_norm_fast,
         num_loo_per_task=config.maml.num_loo_per_task,
+        outer_context_size=outer_context_size,
         reuse_diffusion_noise=config.maml.reuse_diffusion_noise,
         use_math_attention=config.maml.math_attention,
         device=config.run.device,
     )
 
-    device = torch.device(cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu")
-    
     set_seed(config.run.seed)
     
     dataset = QuickDrawEpisodesMAML(
         root=config.data.root,
         split=config.data.split,
-        K=config.data.K,
+        K=resolved_data_k,
         max_seq_len=config.data.max_seq_len,
-        max_query_len=config.data.max_query_len,
-        max_context_len=config.data.max_context_len,
         backend=config.data.backend,
         coordinate_mode=config.data.coordinate_mode,
         index_dir=config.data.index_dir,
@@ -694,10 +1192,8 @@ def main(argv: List[str] | None = None) -> None:
     eval_dataset = QuickDrawEpisodesMAML(
         root=config.data.root,
         split="val",
-        K=config.data.K,
+        K=resolved_data_k,
         max_seq_len=config.data.max_seq_len,
-        max_query_len=config.data.max_query_len,
-        max_context_len=config.data.max_context_len,
         backend=config.data.backend,
         coordinate_mode=config.data.coordinate_mode,
         index_dir=config.data.index_dir,
@@ -706,28 +1202,20 @@ def main(argv: List[str] | None = None) -> None:
         families_cache_path=config.data.families_cache_path,
     )
     
-    noise_scheduler_kwargs = {
-        "num_train_timesteps": config.model.num_train_timesteps,
-        "beta_start": config.model.beta_start,
-        "beta_end": config.model.beta_end,
-        "beta_schedule": config.model.beta_schedule,
-    }
-    
-    policy_cfg = DiTEncDecDiffusionPolicyConfig(
-        horizon=config.model.horizon,
-        point_feature_dim=config.model.input_dim,
-        action_dim=config.model.output_dim,
-        hidden_dim=config.model.hidden_dim,
-        num_layers=config.model.num_layers,
-        num_heads=config.model.num_heads,
-        mlp_dim=config.model.mlp_dim,
-        dropout=config.model.dropout,
-        attention_dropout=config.model.attention_dropout,
-        prediction_type=config.model.prediction_type,
-        num_inference_steps=config.eval.num_inference_steps,
-        noise_scheduler_kwargs=noise_scheduler_kwargs,
-    )
     policy = MAMLDiTEncDecDiffusionPolicy(policy_cfg).to(device)
+    if pretrained_checkpoint is not None:
+        load_result = policy.load_state_dict(
+            pretrained_checkpoint["model"],
+            strict=bool(config.finetune.strict_load),
+        )
+        if not bool(config.finetune.strict_load):
+            print(
+                f"Loaded pretrained checkpoint {pretrained_ckpt_path} "
+                f"with missing_keys={load_result.missing_keys} "
+                f"unexpected_keys={load_result.unexpected_keys}"
+            )
+        else:
+            print(f"Loaded pretrained checkpoint {pretrained_ckpt_path}")
 
     policy = policy.to(device)
     policy.train()
@@ -736,17 +1224,62 @@ def main(argv: List[str] | None = None) -> None:
         policy,
         last_frac=cfg.last_frac_fast,
         include_ada=cfg.include_ada_fast,
+        include_final_norm=cfg.include_final_norm_fast,
+    )
+    outer_names = get_outer_param_names(
+        policy,
+        train_encoder=bool(config.outer.train_encoder),
+        train_decoder=bool(config.outer.train_decoder),
+        train_input_projections=bool(config.outer.train_input_projections),
+        train_output_head=bool(config.outer.train_output_head),
+        train_diffusion_conditioning=bool(config.outer.train_diffusion_conditioning),
+    )
+    missing_fast_outer = sorted(set(fast_names) - set(outer_names))
+    if missing_fast_outer:
+        raise ValueError(
+            "Fast parameters must also be outer-trainable. "
+            f"Missing outer assignments for: {missing_fast_outer[:5]}"
+        )
+    _set_outer_trainable_params(policy, outer_names)
+
+    outer_params = [param for param in policy.parameters() if param.requires_grad]
+    outer_opt = torch.optim.AdamW(
+        outer_params,
+        lr=cfg.outer_lr,
+        weight_decay=cfg.weight_decay,
     )
 
-    # Outer optimizer updates *all* model params (including fast params initializations)
-    outer_opt = torch.optim.AdamW(policy.parameters(), lr=cfg.outer_lr, weight_decay=cfg.weight_decay)
+    print(
+        "Resolved MAML finetuning setup: "
+        f"policy_source={resolved_policy['source']}, "
+        f"data.K={resolved_data_k}, "
+        f"prediction_type={policy_cfg.prediction_type}, "
+        f"outer_context_size={cfg.outer_context_size}, "
+        f"fast_param_tensors={len(fast_names)}, "
+        f"outer_param_tensors={len(outer_names)}, "
+        f"outer_param_count={_count_params_by_name(policy, outer_names):,}, "
+        f"encoder_trainable={bool(config.outer.train_encoder)}"
+    )
 
     base_save_dir = Path(config.checkpoint.dir)
+    run_config = config.to_dict()
+    run_config["resolved"] = {
+        "pretrained_checkpoint": (
+            str(pretrained_ckpt_path) if pretrained_ckpt_path is not None else ""
+        ),
+        "policy": asdict(policy_cfg),
+        "data_k": resolved_data_k,
+        "logging_max_tokens": resolved_logging_max_tokens,
+        "outer_context_size": cfg.outer_context_size,
+        "initial_global_step": initial_global_step,
+        "fast_param_names": fast_names,
+        "outer_param_names": outer_names,
+    }
     if config.wandb.use and config.wandb.project:
         wandb.init(
             project=config.wandb.project,
             entity=getattr(config.wandb, "entity", None),
-            config=config.to_dict(),
+            config=run_config,
         )
         wandb.run.name = wandb.run.id
         save_dir = base_save_dir / wandb.run.id
@@ -779,15 +1312,31 @@ def main(argv: List[str] | None = None) -> None:
     
     eval_loader = DataLoader(
         eval_dataset,
-        batch_size=16,
-        shuffle=False,
+        batch_size=max(1, int(config.eval.samples)),
+        shuffle=True,
         num_workers=0,
         collate_fn=MAMLDiffusionCollator(token_dim=6, coordinate_mode=config.data.coordinate_mode),
         pin_memory=(device.type == "cuda"),
-        drop_last=True,
+        drop_last=False,
     )
     
     eval_iter = iter(eval_loader)
+
+    if config.wandb.use and wandb.run is not None and config.eval.samples > 0:
+        try:
+            initial_eval_tasks = next(iter(eval_loader))
+        except StopIteration:
+            initial_eval_tasks = []
+        _log_initial_eval_samples(
+            policy,
+            initial_eval_tasks,
+            config=config,
+            policy_cfg=policy_cfg,
+            device=device,
+            step=initial_global_step,
+            max_tokens=resolved_logging_max_tokens,
+            num_context_demos=cfg.outer_context_size,
+        )
 
     pg = ProfilerGuard(
         use=config.profiling.use,
@@ -799,7 +1348,7 @@ def main(argv: List[str] | None = None) -> None:
         ),
     )
 
-    global_step = 0
+    global_step = initial_global_step
     for epoch in range(1, config.training.epochs + 1):
         
         for tasks in tqdm(loader):
@@ -811,26 +1360,13 @@ def main(argv: List[str] | None = None) -> None:
             outer_opt.zero_grad(set_to_none=True)
 
             # Force math attention for second-order meta-gradients (safer)
-            if cfg.use_math_attention and device.type == "cuda":
-                ctx = torch.backends.cuda.sdp_kernel(
-                    enable_flash=False,
-                    enable_mem_efficient=False,
-                    enable_math=True,
-                )
-            else:
-                # no-op context manager
-                class _NullCtx:
-                    def __enter__(self): return None
-                    def __exit__(self, exc_type, exc, tb): return False
-                ctx = _NullCtx()
-
-            with ctx:
+            with _maml_attention_ctx(cfg, device):
                 meta_loss = maml_step(
                     policy,
                     tasks=tasks,
                     fast_names=fast_names,
                     cfg=cfg,
-                    horizon=config.model.horizon,
+                    horizon=policy_cfg.horizon,
                 )
 
             meta_loss.backward()
@@ -854,20 +1390,17 @@ def main(argv: List[str] | None = None) -> None:
                     except StopIteration:
                         eval_iter = iter(eval_loader)
                         eval_tasks = next(eval_iter)
-                    
-                    qb = build_query_batch(
-                        task=eval_tasks[0],
-                        horizon=config.model.horizon,
-                        device=device,
-                    )
-                    log_qualitative_samples(
+
+                    _log_maml_eval_samples(
                         policy,
-                        qb,
-                        split="train",
-                        cfg=config,
-                        step=global_step,
+                        eval_tasks,
+                        fast_names=fast_names,
+                        cfg=cfg,
+                        config=config,
+                        policy_cfg=policy_cfg,
                         device=device,
-                        use_partial_history=True,
+                        step=global_step,
+                        max_tokens=resolved_logging_max_tokens,
                     )
 
         if epoch % config.checkpoint.save_interval == 0:
@@ -878,9 +1411,12 @@ def main(argv: List[str] | None = None) -> None:
                     "global_step": global_step,
                     "model": policy.state_dict(),
                     "outer_opt": outer_opt.state_dict(),
+                    "policy_cfg": asdict(policy_cfg),
                     "fast_names": fast_names,
-                    "cfg": config.__dict__,
-                    "maml_cfg": cfg.__dict__,
+                    "outer_names": outer_names,
+                    "resolved": run_config["resolved"],
+                    "config": run_config,
+                    "maml_cfg": asdict(cfg),
                 },
                 ckpt_path,
             )
