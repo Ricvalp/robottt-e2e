@@ -68,5 +68,6 @@ def get_config() -> ConfigDict:
 
     cfg.logging = ConfigDict()
     cfg.logging.output_parent_dir = output_parent_dir
+    cfg.logging.dir = ""
 
     return cfg

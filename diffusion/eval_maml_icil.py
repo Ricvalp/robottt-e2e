@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 from dataclasses import dataclass
 from datetime import datetime
@@ -1340,7 +1341,7 @@ def _compute_fid(
     fast_names: List[str],
     max_tokens: int,
     coordinate_mode: str,
-) -> None:
+) -> Dict[str, Dict[str, float]]:
     if coordinate_mode != "absolute":
         raise ValueError(
             "FID evaluation currently supports only absolute coordinates. "
@@ -1355,6 +1356,7 @@ def _compute_fid(
     ).to(device)
     embedding_model.eval()
 
+    results: Dict[str, Dict[str, float]] = {}
     for split in cfg.eval.fid.splits:
         fid, reference_fid = _compute_fid_for_split(
             policy=policy,
@@ -1372,6 +1374,11 @@ def _compute_fid(
             f"[{split}] FID: {fid:.6f} | "
             f"Reference FID (query vs query): {reference_fid:.6f}"
         )
+        results[str(split)] = {
+            "fid": float(fid),
+            "reference_fid": float(reference_fid),
+        }
+    return results
 
 
 TASKS = {
@@ -1392,10 +1399,11 @@ def run_selected_tasks(
     fast_names: List[str],
     max_tokens: int,
     coordinate_mode: str,
-) -> None:
+) -> Dict[str, object]:
+    results: Dict[str, object] = {}
     for name in tasks:
         if name == "fid":
-            _compute_fid(
+            results["fid"] = _compute_fid(
                 policy=policy,
                 loaders=loaders,
                 cfg=cfg,
@@ -1419,6 +1427,52 @@ def run_selected_tasks(
             max_tokens=max_tokens,
             coordinate_mode=coordinate_mode,
         )
+    return results
+
+
+def _write_eval_summary(
+    *,
+    cfg: ConfigDict,
+    checkpoint_path: Path,
+    output_dir: Path,
+    policy_cfg: DiTEncDecDiffusionPolicyConfig,
+    maml_cfg: MAMLConfig,
+    resolved_data_k: int,
+    max_tokens: int,
+    coordinate_mode: str,
+    results: Dict[str, object],
+) -> None:
+    inference_steps = _resolve_inference_steps(cfg)
+    run_id = checkpoint_path.parent.name
+    summary = {
+        "checkpoint_path": str(checkpoint_path),
+        "run_id": run_id,
+        "output_dir": str(output_dir),
+        "timestamp": datetime.now().isoformat(),
+        "tasks": [str(task) for task in cfg.eval.tasks],
+        "coordinate_mode": str(coordinate_mode),
+        "resolved_data_k": int(resolved_data_k),
+        "outer_context_size": int(maml_cfg.outer_context_size),
+        "num_loo_per_task": int(maml_cfg.num_loo_per_task),
+        "inner_steps": int(maml_cfg.inner_steps),
+        "inner_lr": float(maml_cfg.inner_lr),
+        "inference_steps": int(
+            inference_steps if inference_steps is not None else policy_cfg.num_inference_steps
+        ),
+        "max_tokens": int(max_tokens),
+        "qualitative_split": str(cfg.eval.qualitative_split),
+        "fid": {
+            "enabled": "fid" in [str(task) for task in cfg.eval.tasks],
+            "num_samples": int(cfg.eval.fid.num_samples),
+            "feature_batch_size": int(cfg.eval.fid.feature_batch_size),
+            "splits": [str(split) for split in cfg.eval.fid.splits],
+            "resnet_checkpoint_path": str(cfg.eval.fid.resnet_checkpoint_path),
+            "results": results.get("fid", {}),
+        },
+    }
+    summary_path = output_dir / "eval_summary.json"
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
 
 
 _CONFIG_FILE = config_flags.DEFINE_config_file(
@@ -1480,7 +1534,7 @@ def main(_) -> None:
         ),
     }
 
-    run_selected_tasks(
+    results = run_selected_tasks(
         tasks=cfg.eval.tasks,
         policy=policy,
         loaders=loaders,
@@ -1490,6 +1544,17 @@ def main(_) -> None:
         fast_names=fast_names,
         max_tokens=max_tokens,
         coordinate_mode=coordinate_mode,
+    )
+    _write_eval_summary(
+        cfg=cfg,
+        checkpoint_path=checkpoint_path,
+        output_dir=output_dir,
+        policy_cfg=policy_cfg,
+        maml_cfg=maml_cfg,
+        resolved_data_k=resolved_data_k,
+        max_tokens=max_tokens,
+        coordinate_mode=coordinate_mode,
+        results=results,
     )
 
 
