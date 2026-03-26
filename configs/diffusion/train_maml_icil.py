@@ -74,7 +74,6 @@ def get_config() -> ConfigDict:
 
     cfg.training = ConfigDict()
     cfg.training.epochs = 100
-    cfg.training.lr = 1e-4
     cfg.training.weight_decay = 1e-4
 
     cfg.training.warmup_cosine_annealing = ConfigDict()
