@@ -127,7 +127,7 @@ def get_config() -> ConfigDict:
     cfg.wandb.use = True
     cfg.wandb.project = wandb_project
     cfg.wandb.entity = wandb_entity
-    cfg.wandb.samples_log_interval = 500
+    cfg.wandb.samples_log_interval = 10
     cfg.wandb.log_all = False
 
     return cfg
