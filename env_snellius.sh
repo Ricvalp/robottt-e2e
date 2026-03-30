@@ -12,6 +12,9 @@ export QRD_CACHE_ROOT="/projects/prjs1905/robotics/quick_robot_draw/data/train-v
 # Root of QuickDraw faiss index.
 export QRD_INDEX_ROOT="/projects/prjs1905/robotics/quick_robot_draw/index"
 
+export QRD_RESNET_CHECKPOINT_PARENT_DIR="metrics/checkpoints"
+
+
 # =============================================================================
 # OUTPUT DIRECTORIES
 # =============================================================================
