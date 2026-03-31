@@ -7,7 +7,7 @@ import json
 import math
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Tuple
 
 import matplotlib
 import torch
@@ -136,6 +136,41 @@ def plot_image_grid(
     output_path.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path / name)
     plt.close(fig)
+
+
+def _raw_data_root(output_dir: str | Path) -> Path:
+    return Path(output_dir) / "raw_data"
+
+
+def _serialize_raw_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _serialize_raw_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_serialize_raw_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_serialize_raw_value(item) for item in value)
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _save_raw_plot_data(
+    *,
+    output_dir: str | Path,
+    plot_type: str,
+    name: str,
+    payload: Dict[str, Any],
+    split: str | None = None,
+) -> Path:
+    raw_dir = _raw_data_root(output_dir) / plot_type
+    if split is not None:
+        raw_dir = raw_dir / str(split)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / f"{name}.pt"
+    torch.save(_serialize_raw_value(payload), raw_path)
+    return raw_path
 
 
 def _pad_sequences(
@@ -413,6 +448,20 @@ def _save_empty_sketch_samples(
         valid_ctx = ctx_tokens[ctx_mask].detach().cpu()
         prompts = _split_context_prompts(valid_ctx, cfg.data.K)
         sample_tokens = samples[idx]
+        _save_raw_plot_data(
+            output_dir=cfg.logging.dir,
+            plot_type="empty_sketches",
+            split=split,
+            name=f"sample_{idx:04d}",
+            payload={
+                "plot_type": "empty_sketches",
+                "split": split,
+                "index": idx,
+                "coordinate_mode": str(cfg.data.coordinate_mode),
+                "prompts": prompts,
+                "sample": sample_tokens,
+            },
+        )
 
         total_plots = len(prompts) + 1
         cols = min(total_plots, 3)
@@ -478,6 +527,21 @@ def _save_partial_sketch_samples(
         prompts = _split_context_prompts(valid_ctx, cfg.data.K)
         sample_tokens = samples[idx]
         history_tokens = _history_sketch_from_batch(batch, idx)
+        _save_raw_plot_data(
+            output_dir=cfg.logging.dir,
+            plot_type="partial_sketches",
+            split=split,
+            name=f"sample_{idx:04d}",
+            payload={
+                "plot_type": "partial_sketches",
+                "split": split,
+                "index": idx,
+                "coordinate_mode": str(cfg.data.coordinate_mode),
+                "prompts": prompts,
+                "history": history_tokens,
+                "sample": sample_tokens,
+            },
+        )
 
         total_plots = len(prompts) + 1
         cols = min(total_plots, 3)
@@ -548,6 +612,19 @@ def _save_many_samples(
 
     valid_ctx = base_context[0][base_context_mask[0]].detach().cpu()
     prompts = _split_context_prompts(valid_ctx, cfg.data.K)
+    _save_raw_plot_data(
+        output_dir=cfg.logging.dir,
+        plot_type="many_samples",
+        split=split,
+        name="panel",
+        payload={
+            "plot_type": "many_samples",
+            "split": split,
+            "coordinate_mode": str(cfg.data.coordinate_mode),
+            "prompts": prompts,
+            "samples": samples,
+        },
+    )
 
     total_plots = len(prompts) + len(samples)
     cols = min(total_plots, 3)
@@ -720,6 +797,45 @@ def _compute_fid_for_split(
         gt_features=gt_embeddings.numpy(),
     )
 
+    _save_raw_plot_data(
+        output_dir=cfg.logging.dir,
+        plot_type="fid_grids",
+        split=split,
+        name="generated",
+        payload={
+            "plot_type": "fid_grid",
+            "split": split,
+            "kind": "generated",
+            "images": torch.stack([img.squeeze(0).cpu() for img in generated_images[:64]], dim=0),
+        },
+    )
+    _save_raw_plot_data(
+        output_dir=cfg.logging.dir,
+        plot_type="fid_grids",
+        split=split,
+        name="ground_truth",
+        payload={
+            "plot_type": "fid_grid",
+            "split": split,
+            "kind": "ground_truth",
+            "images": torch.stack([img.squeeze(0).cpu() for img in gt_images[:64]], dim=0),
+        },
+    )
+    _save_raw_plot_data(
+        output_dir=cfg.logging.dir,
+        plot_type="fid_metrics",
+        split=split,
+        name="metrics",
+        payload={
+            "plot_type": "fid_metrics",
+            "split": split,
+            "fid": float(fid),
+            "reference_fid": float(reference_fid),
+            "num_samples": int(cfg.eval.fid.num_samples),
+            "feature_batch_size": int(cfg.eval.fid.feature_batch_size),
+        },
+    )
+
     plot_image_grid(
         images=[img.squeeze().numpy() for img in generated_images[:64]],
         name=f"fid_generated_{split}.png",
@@ -828,6 +944,7 @@ def _write_eval_summary(
         "checkpoint_path": str(checkpoint_path),
         "run_id": run_id,
         "output_dir": str(output_dir),
+        "raw_data_dir": str(output_dir / "raw_data"),
         "timestamp": datetime.now().isoformat(),
         "tasks": [str(task) for task in cfg.eval.tasks],
         "coordinate_mode": str(cfg.data.coordinate_mode),

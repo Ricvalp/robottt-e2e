@@ -141,6 +141,41 @@ def plot_image_grid(
     plt.close(fig)
 
 
+def _raw_data_root(output_dir: str | Path) -> Path:
+    return Path(output_dir) / "raw_data"
+
+
+def _serialize_raw_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _serialize_raw_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_serialize_raw_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_serialize_raw_value(item) for item in value)
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _save_raw_plot_data(
+    *,
+    output_dir: str | Path,
+    plot_type: str,
+    name: str,
+    payload: Dict[str, Any],
+    split: str | None = None,
+) -> Path:
+    raw_dir = _raw_data_root(output_dir) / plot_type
+    if split is not None:
+        raw_dir = raw_dir / str(split)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / f"{name}.pt"
+    torch.save(_serialize_raw_value(payload), raw_path)
+    return raw_path
+
+
 @dataclass
 class MAMLConfig:
     inner_steps: int = 1
@@ -935,6 +970,20 @@ def _save_empty_sketch_samples(
         ctx_mask = context_batch["context_mask"][0]
         valid_ctx = ctx_tokens[ctx_mask].detach().cpu()
         prompts = _split_context_prompts(valid_ctx, maml_cfg.outer_context_size)
+        _save_raw_plot_data(
+            output_dir=cfg.logging.dir,
+            plot_type="empty_sketches",
+            split=split,
+            name=f"sample_{idx:04d}",
+            payload={
+                "plot_type": "empty_sketches",
+                "split": split,
+                "index": idx,
+                "coordinate_mode": str(coordinate_mode),
+                "prompts": prompts,
+                "sample": sample_tokens,
+            },
+        )
 
         total_plots = len(prompts) + 1
         cols = min(total_plots, 3)
@@ -1021,6 +1070,21 @@ def _save_partial_sketch_samples(
         valid_ctx = ctx_tokens[ctx_mask].detach().cpu()
         prompts = _split_context_prompts(valid_ctx, maml_cfg.outer_context_size)
         history_tokens = _history_sketch_from_query_batch(query_batch, 0)
+        _save_raw_plot_data(
+            output_dir=cfg.logging.dir,
+            plot_type="partial_sketches",
+            split=split,
+            name=f"sample_{idx:04d}",
+            payload={
+                "plot_type": "partial_sketches",
+                "split": split,
+                "index": idx,
+                "coordinate_mode": str(coordinate_mode),
+                "prompts": prompts,
+                "history": history_tokens,
+                "sample": sample_tokens,
+            },
+        )
 
         total_plots = len(prompts) + 1
         cols = min(total_plots, 3)
@@ -1120,6 +1184,19 @@ def _save_many_samples(
 
     valid_ctx = context_batch["context"][0][context_batch["context_mask"][0]].detach().cpu()
     prompts = _split_context_prompts(valid_ctx, maml_cfg.outer_context_size)
+    _save_raw_plot_data(
+        output_dir=cfg.logging.dir,
+        plot_type="many_samples",
+        split=split,
+        name="panel",
+        payload={
+            "plot_type": "many_samples",
+            "split": split,
+            "coordinate_mode": str(coordinate_mode),
+            "prompts": prompts,
+            "samples": samples,
+        },
+    )
 
     total_plots = len(prompts) + len(samples)
     cols = min(total_plots, 3)
@@ -1185,18 +1262,28 @@ def _collect_generated_and_gt_queries(
     maml_cfg: MAMLConfig,
     fast_names: List[str],
     max_tokens: int,
+    adapt_fast_params: bool,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], Iterator[List[Dict[str, Any]]]]:
     iterator = iter(loader)
     generated: list[torch.Tensor] = []
     gt_queries: list[torch.Tensor] = []
-    adapted_policy = copy.deepcopy(policy).to(device)
-    adapted_policy.eval()
-    for param in adapted_policy.parameters():
-        param.requires_grad_(False)
+    previous_mode = policy.training
+    if adapt_fast_params:
+        sampling_policy = copy.deepcopy(policy).to(device)
+        sampling_policy.eval()
+        for param in sampling_policy.parameters():
+            param.requires_grad_(False)
+    else:
+        sampling_policy = policy
+        sampling_policy.eval()
 
     with tqdm(
         total=int(cfg.eval.fid.num_samples),
-        desc="Generating samples for FID",
+        desc=(
+            "Generating samples for FID"
+            if adapt_fast_params
+            else "Generating samples for FID (no adaptation)"
+        ),
         unit="sample",
     ) as progress:
         while len(generated) < int(cfg.eval.fid.num_samples):
@@ -1205,16 +1292,17 @@ def _collect_generated_and_gt_queries(
                 task_seed = int(cfg.eval.seed) + len(generated)
                 task_rng = torch.Generator(device=device)
                 task_rng.manual_seed(task_seed)
-                _prepare_adapted_policy_for_task(
-                    base_policy=policy,
-                    adapted_policy=adapted_policy,
-                    task=task,
-                    fast_names=fast_names,
-                    maml_cfg=maml_cfg,
-                    horizon=policy.cfg.horizon,
-                    rng=task_rng,
-                    device=device,
-                )
+                if adapt_fast_params:
+                    _prepare_adapted_policy_for_task(
+                        base_policy=policy,
+                        adapted_policy=sampling_policy,
+                        task=task,
+                        fast_names=fast_names,
+                        maml_cfg=maml_cfg,
+                        horizon=policy.cfg.horizon,
+                        rng=task_rng,
+                        device=device,
+                    )
                 context_batch = _build_context_only_batch(
                     task,
                     device=device,
@@ -1224,7 +1312,7 @@ def _collect_generated_and_gt_queries(
                 sample_generator = torch.Generator(device=device)
                 sample_generator.manual_seed(task_seed)
                 sample = sample_quickdraw_tokens_encoder_decoder(
-                    policy=adapted_policy,
+                    policy=sampling_policy,
                     max_tokens=max_tokens,
                     demos=context_batch,
                     generator=sample_generator,
@@ -1235,6 +1323,9 @@ def _collect_generated_and_gt_queries(
                 progress.update(1)
                 if len(generated) >= int(cfg.eval.fid.num_samples):
                     break
+
+    if not adapt_fast_params and previous_mode:
+        policy.train()
 
     return generated, gt_queries, iterator
 
@@ -1270,6 +1361,8 @@ def _compute_fid_for_split(
     maml_cfg: MAMLConfig,
     fast_names: List[str],
     max_tokens: int,
+    adapt_fast_params: bool,
+    result_key: str,
 ) -> tuple[float, float]:
     generated, gt_queries, iterator = _collect_generated_and_gt_queries(
         policy=policy,
@@ -1279,6 +1372,7 @@ def _compute_fid_for_split(
         maml_cfg=maml_cfg,
         fast_names=fast_names,
         max_tokens=max_tokens,
+        adapt_fast_params=adapt_fast_params,
     )
     reference_gt_queries, _ = _collect_gt_queries(
         iterator=iterator,
@@ -1317,14 +1411,56 @@ def _compute_fid_for_split(
         gt_features=gt_embeddings.numpy(),
     )
 
+    _save_raw_plot_data(
+        output_dir=cfg.logging.dir,
+        plot_type="fid_grids",
+        split=split,
+        name=f"{result_key}_generated",
+        payload={
+            "plot_type": "fid_grid",
+            "split": split,
+            "result_key": result_key,
+            "kind": "generated",
+            "images": torch.stack([img.squeeze(0).cpu() for img in generated_images[:64]], dim=0),
+        },
+    )
+    _save_raw_plot_data(
+        output_dir=cfg.logging.dir,
+        plot_type="fid_grids",
+        split=split,
+        name=f"{result_key}_ground_truth",
+        payload={
+            "plot_type": "fid_grid",
+            "split": split,
+            "result_key": result_key,
+            "kind": "ground_truth",
+            "images": torch.stack([img.squeeze(0).cpu() for img in gt_images[:64]], dim=0),
+        },
+    )
+    _save_raw_plot_data(
+        output_dir=cfg.logging.dir,
+        plot_type="fid_metrics",
+        split=split,
+        name=f"{result_key}_metrics",
+        payload={
+            "plot_type": "fid_metrics",
+            "split": split,
+            "result_key": result_key,
+            "fid": float(fid),
+            "reference_fid": float(reference_fid),
+            "num_samples": int(cfg.eval.fid.num_samples),
+            "feature_batch_size": int(cfg.eval.fid.feature_batch_size),
+        },
+    )
+
     plot_image_grid(
         images=[img.squeeze().numpy() for img in generated_images[:64]],
-        name=f"fid_generated_{split}.png",
+        name=f"{result_key}_generated_{split}.png",
         output_dir=cfg.logging.dir,
     )
     plot_image_grid(
         images=[img.squeeze().numpy() for img in gt_images[:64]],
-        name=f"fid_gt_{split}.png",
+        name=f"{result_key}_gt_{split}.png",
         output_dir=cfg.logging.dir,
     )
 
@@ -1341,6 +1477,8 @@ def _compute_fid(
     fast_names: List[str],
     max_tokens: int,
     coordinate_mode: str,
+    adapt_fast_params: bool,
+    result_key: str,
 ) -> Dict[str, Dict[str, float]]:
     if coordinate_mode != "absolute":
         raise ValueError(
@@ -1369,9 +1507,11 @@ def _compute_fid(
             maml_cfg=maml_cfg,
             fast_names=fast_names,
             max_tokens=max_tokens,
+            adapt_fast_params=adapt_fast_params,
+            result_key=result_key,
         )
         print(
-            f"[{split}] FID: {fid:.6f} | "
+            f"[{result_key}:{split}] FID: {fid:.6f} | "
             f"Reference FID (query vs query): {reference_fid:.6f}"
         )
         results[str(split)] = {
@@ -1412,6 +1552,22 @@ def run_selected_tasks(
                 fast_names=fast_names,
                 max_tokens=max_tokens,
                 coordinate_mode=coordinate_mode,
+                adapt_fast_params=True,
+                result_key="fid",
+            )
+            continue
+        if name == "fid_no_adaptation":
+            results["fid_no_adaptation"] = _compute_fid(
+                policy=policy,
+                loaders=loaders,
+                cfg=cfg,
+                device=device,
+                maml_cfg=maml_cfg,
+                fast_names=fast_names,
+                max_tokens=max_tokens,
+                coordinate_mode=coordinate_mode,
+                adapt_fast_params=False,
+                result_key="fid_no_adaptation",
             )
             continue
         if name not in TASKS:
@@ -1448,6 +1604,7 @@ def _write_eval_summary(
         "checkpoint_path": str(checkpoint_path),
         "run_id": run_id,
         "output_dir": str(output_dir),
+        "raw_data_dir": str(output_dir / "raw_data"),
         "timestamp": datetime.now().isoformat(),
         "tasks": [str(task) for task in cfg.eval.tasks],
         "coordinate_mode": str(coordinate_mode),
@@ -1468,6 +1625,14 @@ def _write_eval_summary(
             "splits": [str(split) for split in cfg.eval.fid.splits],
             "resnet_checkpoint_path": str(cfg.eval.fid.resnet_checkpoint_path),
             "results": results.get("fid", {}),
+        },
+        "fid_no_adaptation": {
+            "enabled": "fid_no_adaptation" in [str(task) for task in cfg.eval.tasks],
+            "num_samples": int(cfg.eval.fid.num_samples),
+            "feature_batch_size": int(cfg.eval.fid.feature_batch_size),
+            "splits": [str(split) for split in cfg.eval.fid.splits],
+            "resnet_checkpoint_path": str(cfg.eval.fid.resnet_checkpoint_path),
+            "results": results.get("fid_no_adaptation", {}),
         },
     }
     summary_path = output_dir / "eval_summary.json"
