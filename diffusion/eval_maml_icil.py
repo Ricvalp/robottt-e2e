@@ -785,6 +785,61 @@ def _build_context_only_batch(
     }
 
 
+def _query_sketches_from_tasks(tasks: List[Dict[str, Any]]) -> list[torch.Tensor]:
+    return [_query_sketch_from_task(task) for task in tasks]
+
+
+def _build_context_only_batch_for_tasks(
+    tasks: List[Dict[str, Any]],
+    *,
+    device: torch.device,
+    rng: torch.Generator,
+    num_context_episodes: int,
+) -> Dict[str, torch.Tensor]:
+    context_sequences: List[torch.Tensor] = []
+    context_lengths: List[int] = []
+
+    for task in tasks:
+        selected_context_episodes = _sample_context_subset(
+            task["context_episodes"],
+            num_context_episodes=num_context_episodes,
+            rng=rng,
+            device=device,
+        )
+        context_tokens = torch.from_numpy(
+            _compose_context_tokens(selected_context_episodes)
+        ).to(device=device, dtype=torch.float32)
+        context_sequences.append(context_tokens)
+        context_lengths.append(int(context_tokens.shape[0]))
+
+    if not context_sequences:
+        raise ValueError("No tasks provided to build batched context.")
+
+    batch_size = len(context_sequences)
+    max_context_len = max(context_lengths)
+    feature_dim = int(context_sequences[0].shape[-1])
+
+    context = torch.zeros(
+        (batch_size, max_context_len, feature_dim),
+        dtype=torch.float32,
+        device=device,
+    )
+    context_mask = torch.zeros(
+        (batch_size, max_context_len),
+        dtype=torch.bool,
+        device=device,
+    )
+
+    for idx, (context_tokens, context_len) in enumerate(zip(context_sequences, context_lengths)):
+        context[idx, -context_len:] = context_tokens
+        context_mask[idx, -context_len:] = True
+
+    return {
+        "context": context,
+        "context_mask": context_mask,
+    }
+
+
 def _copy_fast_params_into_model(
     target_model: nn.Module,
     *,
@@ -1276,6 +1331,8 @@ def _collect_generated_and_gt_queries(
     else:
         sampling_policy = policy
         sampling_policy.eval()
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(cfg.eval.seed))
 
     with tqdm(
         total=int(cfg.eval.fid.num_samples),
@@ -1288,6 +1345,28 @@ def _collect_generated_and_gt_queries(
     ) as progress:
         while len(generated) < int(cfg.eval.fid.num_samples):
             tasks, iterator = _next_or_restart_tasks(iterator, loader)
+            if not adapt_fast_params:
+                context_batch = _build_context_only_batch_for_tasks(
+                    tasks,
+                    device=device,
+                    rng=generator,
+                    num_context_episodes=maml_cfg.outer_context_size,
+                )
+                samples = sample_quickdraw_tokens_encoder_decoder(
+                    policy=sampling_policy,
+                    max_tokens=max_tokens,
+                    demos=context_batch,
+                    generator=generator,
+                    inference_steps=_resolve_inference_steps(cfg),
+                )
+                gt_batch = _query_sketches_from_tasks(tasks)
+                remaining = int(cfg.eval.fid.num_samples) - len(generated)
+                take = min(remaining, len(samples), len(gt_batch))
+                generated.extend(samples[:take])
+                gt_queries.extend(gt_batch[:take])
+                progress.update(take)
+                continue
+
             for task in tasks:
                 task_seed = int(cfg.eval.seed) + len(generated)
                 task_rng = torch.Generator(device=device)
