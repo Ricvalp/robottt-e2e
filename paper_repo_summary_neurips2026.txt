@@ -1,0 +1,787 @@
+Repository summary for NeurIPS 2026 paper drafting
+===============================================
+
+Title / working theme
+---------------------
+
+This repository implements a QuickDraw sketch-generation pipeline based on:
+
+1. in-context diffusion pretraining with retrieved demonstrations
+2. MAML finetuning for task-specific adaptation from a few support sketches
+
+The likely paper framing is:
+
+"A benchmark and evaluation protocol for in-context sketch generation with diffusion models and meta-learning adaptation."
+
+The codebase is suitable for an Evaluation / Datasets style paper because it combines:
+
+- a structured episodic formulation on QuickDraw
+- family-balanced train/val class splits
+- a retrieval-based conditioning protocol
+- standardized qualitative evaluation and FID on rasterized sketches
+- a comparison between plain in-context pretrained generation and meta-learned fast adaptation
+
+
+1. What this repository is
+--------------------------
+
+At a high level, the repository studies class-conditional sketch generation in an in-context setting.
+
+Each prediction problem is built as:
+
+- a set of context sketches from the same class
+- one target/query sketch from that class
+
+The model is not asked to classify or retrieve; it is asked to generate a sketch conditioned on the demonstrations.
+
+The repository has two training stages:
+
+Stage A: diffusion pretraining
+- train an encoder-decoder diffusion policy to generate query sketches conditioned on K prompt sketches
+- prompt sketches are not sampled uniformly; they are selected as nearest neighbors to the query in a learned image-embedding space
+
+Stage B: MAML finetuning
+- start from the pretrained diffusion policy
+- meta-learn an initialization such that 1 or a few gradient steps on support sketches improve performance on a held-out query
+
+The evaluation code supports:
+
+- qualitative plots
+- FID on rasterized sketches for pretrained checkpoints
+- FID on rasterized sketches for MAML checkpoints with adaptation
+- FID on rasterized sketches for MAML checkpoints without adaptation
+
+
+2. Dataset and split
+--------------------
+
+The repository uses processed sketches derived from the Google Quick, Draw! dataset.
+
+Important facts visible in the current cached dataset manifest:
+
+- number of families/classes: 345
+- train families: 311
+- val families: 34
+
+This means evaluation is class-disjoint at the family level, at least for the cached train/val split currently present in the repo.
+
+The dataset cache lives under:
+
+- `data/train-val-split`
+
+The manifest file is:
+
+- `data/train-val-split/DatasetManifest.json`
+
+The train/val assignment is recorded in `family_split_map` in the manifest.
+
+This is important for a paper because it means the val performance is not merely on unseen sketches from seen classes; it is on held-out families.
+
+
+3. Sketch preprocessing pipeline
+--------------------------------
+
+Raw sketches are converted into a canonical continuous sequence representation.
+
+The preprocessing in `dataset/preprocess.py` does the following:
+
+- reads raw stroke sequences
+- optionally resamples and simplifies strokes
+- flattens multi-stroke sketches into a single sequence of 2D points
+- stores:
+  - absolute coordinates
+  - delta coordinates
+  - pen state
+  - metadata
+- normalizes sketches into a consistent coordinate frame
+
+The main processed object is `ProcessedSketch`, which contains:
+
+- `absolute`
+- `deltas`
+- `pen`
+- `length`
+- `metadata`
+
+This is important because the same processed sketch can later be tokenized in:
+
+- absolute coordinate mode
+- delta coordinate mode
+
+In the current training/evaluation artifacts, the visible runs use:
+
+- `coordinate_mode = absolute`
+
+
+4. Episode construction
+-----------------------
+
+There are two episode builders relevant to the current method:
+
+1. `EpisodeBuilderSimilar`
+2. `EpisodeBuilderSimilarMAML`
+
+The base tokenized pretraining episode is built as:
+
+`[SEP, prompt_1, SEP, ..., prompt_K, SEP, RESET, SEP, query, STOP]`
+
+where the full 7-dimensional token channels are:
+
+- x
+- y
+- pen
+- not_pen
+- sep
+- reset
+- stop
+
+Later, the collator removes the reset channel and the model works on 6-dimensional tokens:
+
+- x
+- y
+- pen
+- not_pen
+- sep
+- stop
+
+Why this matters:
+
+- the model does not simply generate a whole sketch from scratch
+- during training it is trained on a diffusion denoising objective over a future action chunk of the query
+- the query is split into:
+  - observed prefix (`history`)
+  - next horizon tokens (`actions`)
+
+
+5. Similarity-driven prompt selection
+-------------------------------------
+
+Prompt selection is retrieval-based, not random.
+
+The pipeline is:
+
+1. rasterize sketches into images
+2. train a one-channel ResNet18 classifier on sketch images
+3. remove the classifier head and use the penultimate representation as an embedding
+4. L2-normalize embeddings
+5. build one FAISS index per family using inner product search
+
+Because embeddings are normalized, FAISS `IndexFlatIP` behaves like cosine similarity search.
+
+Then, during episode construction:
+
+- a query sketch is selected
+- its embedding is reconstructed from the family index
+- the nearest neighbors within the same family are used as the prompt set
+
+This is implemented in:
+
+- `metrics/train_resnet18.py`
+- `metrics/compute_embeddings.py`
+- `metrics/build_faiss_index.py`
+- `dataset/episode_builder.py`
+
+The method therefore conditions generation on semantically or stylistically similar sketches within the same class, rather than arbitrary in-class prompts.
+
+
+6. Model architecture
+---------------------
+
+The main model is an encoder-decoder diffusion policy implemented in:
+
+- `diffusion/policies/dit_encdec_policy.py`
+- `diffusion/models/dit/encoder.py`
+- `diffusion/models/dit/decoder.py`
+
+6.1 High-level structure
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The model has:
+
+- a Transformer encoder over context sketches
+- a Transformer decoder over:
+  - observed query history
+  - noisy future action tokens
+
+The decoder cross-attends to the encoded context memory.
+
+6.2 Input structure
+~~~~~~~~~~~~~~~~~~~
+
+The model receives:
+
+- `context`: padded prompt tokens
+- `context_mask`
+- `history`: padded observed query prefix
+- `query_mask`
+- `actions`: the future horizon chunk to denoise during training
+
+Context and history are projected separately:
+
+- `point_feature_proj` for context
+- `history_feature_proj` for history
+
+The future action chunk is projected with:
+
+- `action_encoder`
+
+6.3 Positional / temporal encoding
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+There are two sinusoidal embedders:
+
+- `world_time_embedder`
+  - used for token position within the sketch/history/action sequence
+- `diffusion_time_embedder`
+  - used for DDPM timestep conditioning
+
+Both are sinusoidal embeddings with configurable base:
+
+- `time_embedding_base`
+- `diffusion_embedding_base`
+
+6.4 Encoder
+~~~~~~~~~~~
+
+The encoder is a standard Transformer encoder stack:
+
+- `num_layers`
+- `num_heads`
+- `hidden_dim`
+- `mlp_dim`
+
+Each block contains:
+
+- LayerNorm
+- self-attention
+- residual
+- LayerNorm
+- MLP
+- residual
+
+6.5 Decoder
+~~~~~~~~~~~
+
+The decoder is a DiT-style block stack with:
+
+- self-attention
+- cross-attention
+- MLP
+
+Each decoder block is modulated by diffusion-time conditioning through an AdaLN-style MLP.
+
+More precisely, each block predicts:
+
+- shift / scale / gate for self-attention
+- shift / scale / gate for cross-attention
+- shift / scale / gate for the MLP
+
+The final decoder normalization is also adaptive (`AdaLayerNormZero` style).
+
+This architecture is important for the MAML stage because the fast adaptation is restricted to the MLP-like modulation layers rather than the attention weights.
+
+
+7. Diffusion objective
+----------------------
+
+The model is trained with a DDPM scheduler from `diffusers`.
+
+Training proceeds by:
+
+- sampling a timestep `t`
+- sampling noise
+- noising the clean future action chunk `x0`
+- predicting the diffusion target from context + history + noisy future tokens
+
+The repository now supports three training targets:
+
+- `epsilon`
+- `sample` (x0)
+- `v_prediction`
+
+The currently visible configs and checkpoints use:
+
+- `prediction_type = v_prediction`
+
+The loss is MSE between the predicted output and the chosen target.
+
+During sampling, the scheduler interprets the model output according to the same `prediction_type`.
+
+
+8. Pretraining method in detail
+-------------------------------
+
+Main script:
+
+- `diffusion/pretrain_encoder_decoder.py`
+
+Main config:
+
+- `configs/diffusion/pretrain_encoder_decoder.py`
+
+How pretraining works:
+
+1. Load `QuickDrawEpisodes` with `EpisodeBuilderSimilar`
+2. Each dataset example is a full flattened episode
+3. The collator (`ContextQueryInContextDiffusionCollator`) finds the reset token
+4. It samples a random split point inside the query
+5. It returns:
+   - `context`
+   - `history`
+   - `actions`
+   - masks
+6. The policy predicts the diffusion target on the next horizon chunk
+
+Important points:
+
+- The context is retrieved nearest-neighbor context, not random context
+- The query prefix length is randomized during training
+- The training objective is chunk-level denoising, not direct autoregressive next-token prediction
+- Qualitative sampling starts from a single `[SEP]` token and then generates horizon-sized chunks autoregressively
+
+The current default pretraining config file says:
+
+- K = 4
+- max_seq_len = 480
+- max_query_len = 60
+- coordinate_mode = absolute
+- num_train_timesteps = 1000
+- hidden_dim = 512
+- num_layers = 4
+- num_heads = 4
+- mlp_dim = 1024
+- horizon = 8
+- prediction_type = v_prediction
+
+However, the actual saved checkpoints present in the workspace were trained with:
+
+- hidden_dim = 256
+
+So for the paper, the saved checkpoints should be treated as the authoritative runs, not necessarily the latest config defaults.
+
+
+9. MAML finetuning method in detail
+-----------------------------------
+
+Main script:
+
+- `diffusion/train_maml_icil.py`
+
+There are also optimized variants:
+
+- `diffusion/train_maml_icil_v2.py`
+- `diffusion/train_maml_icil_v3.py`
+
+9.1 Initialization
+~~~~~~~~~~~~~~~~~~
+
+MAML finetuning starts from a pretrained encoder-decoder diffusion checkpoint.
+
+The script recovers from the checkpoint:
+
+- model architecture
+- horizon
+- scheduler settings
+- prediction type
+- diffusion beta schedule
+- pretrained K
+- inference steps for evaluation if left unresolved in the MAML config
+
+This is crucial because current config defaults have drifted relative to older runs.
+
+9.2 Meta-task structure
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The intended construction is:
+
+- sample `K_maml = K_pretrain + 1` context demos
+- sample 1 query sketch
+
+Support construction:
+
+- choose `m = num_loo_per_task` held-out context sketches
+- for each held-out sketch:
+  - prompts are the remaining `K_pretrain` context sketches
+  - the held-out sketch becomes the support query
+  - the exact same pretraining-style pseudo-episode structure is used
+
+Outer query construction:
+
+- randomly sample a subset of size `K_pretrain` from the `K_maml` context demos
+- use the real task query sketch as the query target
+
+This design keeps the outer conditioning distribution aligned with pretraining, even though the task itself contains one extra demo to enable leave-one-out adaptation.
+
+9.3 Fast and slow parameters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Fast parameters (adapted in the inner loop):
+
+- last 25% of decoder blocks
+- decoder MLP weights
+- decoder AdaLN modulation MLPs
+- final decoder normalization/modulation MLP
+
+Fast parameters explicitly exclude:
+
+- encoder weights
+- self-attention weights
+- cross-attention weights
+- input projection layers
+- diffusion embedding MLPs
+
+Slow / outer-trainable parameters in the current recipe:
+
+- full decoder
+- point/history/action projections
+- output head
+- diffusion conditioning path
+- encoder frozen by default
+
+For the saved visible MAML checkpoint (`toxvieal`):
+
+- number of fast parameter tensors: 8
+- number of fast scalar parameters: 1,249,280
+- number of outer-trainable scalar parameters: 7,043,590
+
+9.4 Inner loop
+~~~~~~~~~~~~~~
+
+For each task:
+
+1. sample `m` leave-one-out support batches
+2. average support losses
+3. compute gradients with `create_graph=True`
+4. update only the fast parameters
+
+Current visible MAML checkpoint settings:
+
+- inner_steps = 1
+- inner_lr = 3e-4
+- num_loo_per_task = 2
+- reuse_diffusion_noise = True
+
+The implementation uses:
+
+- `torch.func.functional_call`
+- second-order gradients
+- math-only SDPA on CUDA for grad-of-grad stability
+
+9.5 Outer loop
+~~~~~~~~~~~~~~
+
+After fast adaptation:
+
+- build the real query batch for the task
+- evaluate query loss using the adapted fast weights
+- average across tasks to get `meta_loss`
+- backprop through the entire inner update
+
+This is full second-order MAML, not first-order MAML.
+
+
+10. Engineering variants for faster MAML
+----------------------------------------
+
+The original MAML script is correct but relatively slow because it performs many small Python-level forwards.
+
+Two experimental speed-optimized variants are present:
+
+`train_maml_icil_v2.py`
+- batches the selected leave-one-out support episodes within each task
+- moves MAML task episodes into torch tensors earlier in the pipeline
+
+`train_maml_icil_v3.py`
+- preprocesses the full outer batch into per-task support/query tensors before entering `maml_step`
+
+These scripts are intended as engineering variants, not conceptual method changes.
+
+
+11. Evaluation methodology
+--------------------------
+
+11.1 Pretrained checkpoint evaluation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Main script:
+
+- `diffusion/eval_encoder_decoder.py`
+
+This script supports:
+
+- qualitative sampling
+- FID on rasterized sketches
+
+FID is computed between:
+
+- generated sketches
+- real query sketches from the same split
+
+A reference FID is also computed between:
+
+- one set of real queries
+- another set of real queries
+
+This reference score measures finite-sample variability and gives a lower-bound sanity check.
+
+11.2 MAML checkpoint evaluation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Main script:
+
+- `diffusion/eval_maml_icil.py`
+
+This script supports two different FID modes:
+
+1. `fid`
+   - for each task:
+     - adapt fast parameters on the task support set
+     - sample from the adapted policy
+   - this is task-by-task, not batched, because each task has different adapted weights
+
+2. `fid_no_adaptation`
+   - load the MAML-finetuned checkpoint
+   - do not adapt fast parameters
+   - sample directly from the raw loaded policy
+   - this now batches generation exactly like pretrained evaluation
+
+This distinction is important for the paper:
+
+- `fid` measures the full meta-learning procedure including adaptation
+- `fid_no_adaptation` measures the base generative quality of the finetuned checkpoint without any test-time update
+
+11.3 FID details
+~~~~~~~~~~~~~~~~
+
+FID is computed after rasterizing sketches into grayscale images.
+
+Feature extractor:
+
+- a one-channel ResNet18
+- trained as a 345-way classifier
+- final FC layer removed for feature extraction
+
+The current evaluation summaries use:
+
+- 8192 samples per split
+- feature batch size 128
+- `metrics/checkpoints/resnet18_step90000.pt`
+- 10 diffusion inference steps during evaluation
+
+
+12. Concrete runs visible in the repository
+-------------------------------------------
+
+This section is based only on saved checkpoints and `outputs/*/eval_summary.json` files that are present right now.
+
+12.1 Pretrained run `36a6n1g8`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Checkpoint:
+
+- `eval_checkpoints/36a6n1g8/policy_epoch_010.pt`
+
+Recovered config:
+
+- type: pretrained encoder-decoder diffusion policy
+- K = 4
+- max_seq_len = 480
+- coordinate_mode = absolute
+- hidden_dim = 256
+- num_layers = 4
+- num_heads = 4
+- mlp_dim = 1024
+- horizon = 8
+- prediction_type = v_prediction
+- num_inference_steps saved in checkpoint config = 1000
+
+Model size:
+
+- total parameters: 10,203,142
+
+Saved FID evaluation:
+
+- evaluation timestamp: `2026-03-26 15:28:16`
+- inference steps used for eval: 10
+- train FID: 4.4271
+- train reference FID: 1.0495
+- val FID: 5.2525
+- val reference FID: 0.9272
+
+12.2 Pretrained run `7r4lvabj`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Checkpoint:
+
+- `eval_checkpoints/7r4lvabj/policy_epoch_011.pt`
+
+Recovered config:
+
+- K = 4
+- max_seq_len = 480
+- coordinate_mode = absolute
+- hidden_dim = 256
+- num_layers = 4
+- num_heads = 4
+- mlp_dim = 1024
+- horizon = 16
+- prediction_type = v_prediction
+
+Model size:
+
+- total parameters: 10,203,142
+
+Saved evaluations:
+
+Run A:
+- timestamp: `2026-03-27 12:33:00`
+- inference steps: 10
+- train FID: 4.4165
+- val FID: 5.1134
+
+Run B:
+- timestamp: `2026-03-27 12:46:32`
+- inference steps: 10
+- train FID: 4.2165
+- val FID: 5.3854
+
+Interpretation:
+
+- these appear to be repeated evaluations of the same checkpoint
+- the variation is likely due to stochastic sampling and finite-sample FID estimation
+
+12.3 MAML run `toxvieal`
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Checkpoint:
+
+- `eval_checkpoints/toxvieal/latest.pt`
+
+Recovered resolved metadata:
+
+- initialized from pretrained checkpoint:
+  - `/projects/prjs1905/robotics/quick_robot_draw/runs/checkpoints/encoder_decoder/7r4lvabj/policy_epoch_011.pt`
+- resolved policy horizon: 16
+- resolved `K_maml = 5`
+- resolved `outer_context_size = 4`
+- max_tokens for eval/logging: 80
+
+Recovered MAML settings:
+
+- inner_steps = 1
+- inner_lr = 3e-4
+- outer_lr = 5e-5
+- weight_decay = 1e-4
+- max_grad_norm = 1.0
+- last_frac_fast = 0.25
+- include_ada_fast = True
+- include_final_norm_fast = True
+- num_loo_per_task = 2
+- reuse_diffusion_noise = True
+- math attention = True
+- encoder frozen in the outer loop
+
+Model size:
+
+- total parameters: 10,203,142
+
+Saved adapted FID evaluation:
+
+- timestamp: `2026-03-27 03:43:22`
+- inference steps: 10
+- train FID: 4.7179
+- train reference FID: 2.3087
+- val FID: 5.8017
+- val reference FID: 1.9897
+
+Important note:
+
+- a no-adaptation MAML FID path (`fid_no_adaptation`) is now implemented in the repo
+- however, no saved `fid_no_adaptation` summary is currently present in `outputs/`
+
+
+13. What experiments are implemented vs. what is visibly run
+------------------------------------------------------------
+
+Implemented in code:
+
+- pretraining with similarity-retrieved in-context conditioning
+- evaluation of pretrained checkpoints with FID and qualitative plots
+- MAML finetuning from pretrained checkpoints
+- MAML qualitative evaluation with per-task adaptation
+- MAML FID with adaptation
+- MAML FID without adaptation
+- two speed-optimized MAML training variants (`v2`, `v3`)
+
+Clearly visible as saved run artifacts in the workspace:
+
+- ResNet18 feature extractor checkpoints up to step 90000
+- at least two pretrained diffusion runs (`36a6n1g8`, `7r4lvabj`)
+- at least one MAML finetuning checkpoint (`toxvieal`)
+- saved FID summaries for:
+  - pretrained run `36a6n1g8`
+  - pretrained run `7r4lvabj` (twice)
+  - adapted MAML run `toxvieal`
+
+Not yet visible as saved artifacts here:
+
+- a saved `fid_no_adaptation` MAML evaluation summary
+- multi-seed or multi-checkpoint MAML sweeps
+- ablations over fast-parameter choice
+- ablations over number of LOO support tasks per meta-step
+- ablations over inference steps at evaluation time
+
+
+14. Suggested paper framing
+---------------------------
+
+A paper based on this repository could emphasize:
+
+1. Dataset / protocol contribution
+- a class-disjoint train/val split for sketch-conditioned generation on QuickDraw
+- a retrieval-based in-context conditioning protocol
+- a standardized evaluation stack including reference-FID and adaptation-aware evaluation
+
+2. Method contribution
+- encoder-decoder diffusion with retrieved demonstrations
+- meta-learning adaptation in a restricted decoder subspace
+- direct comparison between:
+  - pretrained in-context generation
+  - MAML with test-time adaptation
+  - MAML checkpoint without adaptation
+
+3. Evaluation contribution
+- measure not only unconditional visual quality, but quality under an adaptation protocol
+- compare adapted and non-adapted versions of the same MAML-finetuned checkpoint
+
+
+15. Important caveats for writing the paper
+-------------------------------------------
+
+1. Do not assume current config defaults equal the saved runs.
+The current pretraining config file defaults to `hidden_dim=512`, but the visible saved pretrained checkpoints were trained with `hidden_dim=256`.
+
+2. Use saved checkpoint configs as the authoritative source.
+The codebase is designed to reconstruct models from checkpoint configs precisely because defaults changed over time.
+
+3. Be careful to distinguish:
+- implementation capability
+- runs actually present in the repository
+
+4. The current visible MAML result (`toxvieal`) should not be overclaimed.
+There is only one visible saved adapted-FID summary in the workspace.
+
+5. The repeated FID evaluations for `7r4lvabj` show some Monte Carlo / evaluation variance.
+That suggests any paper claims should ideally use repeated evaluations or seeds.
+
+
+16. A concise method paragraph you can reuse
+--------------------------------------------
+
+We formulate sketch generation as in-context conditional diffusion. For each task, the model receives K context sketches from the same QuickDraw family and is trained to generate a target query sketch. Context sketches are selected by nearest-neighbor retrieval in a learned image-embedding space, rather than by random within-class sampling. The generator is a DiT-style encoder-decoder diffusion policy: a Transformer encoder processes the context set, while a Transformer decoder processes the observed query prefix and a noisy future action chunk, with cross-attention to the encoded context and AdaLN-style modulation by the diffusion timestep. After pretraining this model with the standard diffusion denoising objective, we finetune it with second-order MAML. In the inner loop, we construct leave-one-out support problems from the context set and update only a restricted subset of late decoder MLP/AdaLN parameters. In the outer loop, we evaluate the adapted model on the true query sketch conditioned on a subset of context demos matching the pretraining context size. This yields a meta-learned initialization that is explicitly optimized for rapid adaptation from a few support sketches.
+
+
+17. A concise experiments paragraph you can reuse
+-------------------------------------------------
+
+The current repository implements and evaluates three types of experiments: (i) encoder-decoder diffusion pretraining with retrieved in-context demonstrations, (ii) MAML finetuning of the pretrained diffusion policy using leave-one-out support losses, and (iii) evaluation with raster-image FID computed from a task-specific one-channel ResNet18 feature extractor. Saved artifacts in the repository show at least two pretrained runs and one MAML finetuning run. The pretrained checkpoints were evaluated with 8192-sample FID on both train and validation families at 10 diffusion sampling steps. The MAML checkpoint was evaluated with task-wise fast adaptation before sampling, and the codebase now also supports a no-adaptation FID mode for the same finetuned checkpoints.
