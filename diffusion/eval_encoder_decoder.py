@@ -355,6 +355,9 @@ def _policy_cfg_from_checkpoint(saved_cfg: dict) -> DiTEncDecDiffusionPolicyConf
         scalar_embedding_hidden_dim=model_cfg.get("scalar_embedding_hidden_dim", 128),
         time_embedding_base=model_cfg.get("time_embedding_base", 10000.0),
         diffusion_embedding_base=model_cfg.get("diffusion_embedding_base", 10000.0),
+        objective_type=model_cfg.get("objective_type", "diffusion"),
+        regression_loss=model_cfg.get("regression_loss", "mse"),
+        regression_fixed_variance=model_cfg.get("regression_fixed_variance", 1.0),
         prediction_type=model_cfg.get("prediction_type", "epsilon"),
         num_inference_steps=eval_cfg["num_inference_steps"],
         noise_scheduler_kwargs=noise_scheduler_kwargs,
@@ -948,6 +951,12 @@ def _write_eval_summary(
         "timestamp": datetime.now().isoformat(),
         "tasks": [str(task) for task in cfg.eval.tasks],
         "coordinate_mode": str(cfg.data.coordinate_mode),
+        "objective_type": str(checkpoint_cfg["model"].get("objective_type", "diffusion")),
+        "regression_loss": str(checkpoint_cfg["model"].get("regression_loss", "mse")),
+        "regression_fixed_variance": float(
+            checkpoint_cfg["model"].get("regression_fixed_variance", 1.0)
+        ),
+        "prediction_type": str(checkpoint_cfg["model"].get("prediction_type", "epsilon")),
         "inference_steps": int(
             inference_steps if inference_steps is not None else checkpoint_cfg["eval"]["num_inference_steps"]
         ),
@@ -988,8 +997,11 @@ def main(_) -> None:
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Saving eval outputs to: {output_dir}")
     print(
-        "Policy inference steps: "
-        f"{_resolve_inference_steps(cfg) or checkpoint_cfg['eval']['num_inference_steps']}"
+        "Resolved eval setup: "
+        f"objective_type={policy.cfg.objective_type}, "
+        f"regression_loss={policy.cfg.regression_loss}, "
+        f"prediction_type={policy.cfg.prediction_type}, "
+        f"inference_steps={_resolve_inference_steps(cfg) or checkpoint_cfg['eval']['num_inference_steps']}"
     )
 
     loaders = {

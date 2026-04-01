@@ -98,6 +98,9 @@ def get_config() -> ConfigDict:
     cfg.model.beta_start = 1e-4
     cfg.model.beta_end = 2e-2
     cfg.model.beta_schedule = "scaled_linear"
+    cfg.model.objective_type = "diffusion"
+    cfg.model.regression_loss = "mse"
+    cfg.model.regression_fixed_variance = 1.0
     cfg.model.prediction_type = "v_prediction"
     cfg.model.hidden_dim = 512
     cfg.model.num_layers = 4

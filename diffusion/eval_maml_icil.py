@@ -279,6 +279,9 @@ def _policy_cfg_from_checkpoint(checkpoint: Dict[str, Any]) -> DiTEncDecDiffusio
         scalar_embedding_hidden_dim=model_cfg.get("scalar_embedding_hidden_dim", 128),
         time_embedding_base=model_cfg.get("time_embedding_base", 10000.0),
         diffusion_embedding_base=model_cfg.get("diffusion_embedding_base", 10000.0),
+        objective_type=model_cfg.get("objective_type", "diffusion"),
+        regression_loss=model_cfg.get("regression_loss", "mse"),
+        regression_fixed_variance=model_cfg.get("regression_fixed_variance", 1.0),
         prediction_type=model_cfg.get("prediction_type", "epsilon"),
         num_inference_steps=eval_cfg.get("num_inference_steps", 50),
         noise_scheduler_kwargs=noise_scheduler_kwargs,
@@ -1687,6 +1690,10 @@ def _write_eval_summary(
         "timestamp": datetime.now().isoformat(),
         "tasks": [str(task) for task in cfg.eval.tasks],
         "coordinate_mode": str(coordinate_mode),
+        "objective_type": str(policy_cfg.objective_type),
+        "regression_loss": str(policy_cfg.regression_loss),
+        "regression_fixed_variance": float(policy_cfg.regression_fixed_variance),
+        "prediction_type": str(policy_cfg.prediction_type),
         "resolved_data_k": int(resolved_data_k),
         "outer_context_size": int(maml_cfg.outer_context_size),
         "num_loo_per_task": int(maml_cfg.num_loo_per_task),
@@ -1756,6 +1763,8 @@ def main(_) -> None:
         f"num_loo_per_task={maml_cfg.num_loo_per_task}, "
         f"inner_steps={maml_cfg.inner_steps}, "
         f"inner_lr={maml_cfg.inner_lr}, "
+        f"objective_type={policy_cfg.objective_type}, "
+        f"regression_loss={policy_cfg.regression_loss}, "
         f"prediction_type={policy_cfg.prediction_type}, "
         f"inference_steps={_resolve_inference_steps(cfg) or policy_cfg.num_inference_steps}"
     )

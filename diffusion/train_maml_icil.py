@@ -281,10 +281,20 @@ def _resolve_policy_config(
         num_inference_steps = int(eval_cfg.get("num_inference_steps", 50))
     if num_inference_steps <= 0:
         num_inference_steps = 50
+    objective_type = str(model_cfg.get("objective_type", "diffusion"))
+    regression_loss = str(model_cfg.get("regression_loss", "mse"))
+    regression_fixed_variance = float(
+        model_cfg.get("regression_fixed_variance", 1.0)
+    )
 
     resolved = {
         "source": source,
-        "model": dict(model_cfg),
+        "model": {
+            **dict(model_cfg),
+            "objective_type": objective_type,
+            "regression_loss": regression_loss,
+            "regression_fixed_variance": regression_fixed_variance,
+        },
         "num_inference_steps": num_inference_steps,
     }
     policy_cfg = DiTEncDecDiffusionPolicyConfig(
@@ -297,6 +307,9 @@ def _resolve_policy_config(
         mlp_dim=int(model_cfg["mlp_dim"]),
         dropout=float(model_cfg["dropout"]),
         attention_dropout=float(model_cfg["attention_dropout"]),
+        objective_type=objective_type,
+        regression_loss=regression_loss,
+        regression_fixed_variance=regression_fixed_variance,
         prediction_type=str(model_cfg["prediction_type"]),
         num_inference_steps=num_inference_steps,
         noise_scheduler_kwargs={
@@ -1253,6 +1266,8 @@ def main(argv: List[str] | None = None) -> None:
         "Resolved MAML finetuning setup: "
         f"policy_source={resolved_policy['source']}, "
         f"data.K={resolved_data_k}, "
+        f"objective_type={policy_cfg.objective_type}, "
+        f"regression_loss={policy_cfg.regression_loss}, "
         f"prediction_type={policy_cfg.prediction_type}, "
         f"outer_context_size={cfg.outer_context_size}, "
         f"fast_param_tensors={len(fast_names)}, "

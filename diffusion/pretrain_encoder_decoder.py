@@ -287,6 +287,9 @@ def main(_) -> None:
         mlp_dim=cfg.model.mlp_dim,
         dropout=cfg.model.dropout,
         attention_dropout=cfg.model.attention_dropout,
+        objective_type=cfg.model.objective_type,
+        regression_loss=cfg.model.regression_loss,
+        regression_fixed_variance=cfg.model.regression_fixed_variance,
         prediction_type=cfg.model.prediction_type,
         num_inference_steps=cfg.eval.num_inference_steps,
         noise_scheduler_kwargs=noise_scheduler_kwargs,
@@ -390,7 +393,7 @@ def main(_) -> None:
                 scheduler.step()
 
             global_step += 1
-            progress.set_postfix({"mse": metrics["mse"]})
+            progress.set_postfix({"loss": metrics["loss"]})
 
             if (
                 cfg.wandb.use
@@ -399,7 +402,9 @@ def main(_) -> None:
             ):
                 wandb.log(
                     {
-                        "train/loss": metrics["mse"],
+                        "train/loss": metrics["loss"],
+                        "train/objective_type": policy.objective_type,
+                        "train/regression_loss": policy.regression_loss,
                         "train/lr": optimizer.param_groups[0]["lr"],
                     },
                     step=global_step,

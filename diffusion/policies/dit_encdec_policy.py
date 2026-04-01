@@ -1,4 +1,4 @@
-"""Minimal diffusion policy built around the DiT encoder-decoder architecture."""
+"""Encoder-decoder policy supporting diffusion and direct chunk regression."""
 
 from __future__ import annotations
 
@@ -16,6 +16,40 @@ from diffusion.models.dit import (
     EncoderTransformer,
     EncoderTransformerConfig,
 )
+
+
+def _normalize_objective_type(objective_type: str) -> str:
+    value = str(objective_type).strip().lower()
+    aliases = {
+        "diffusion": "diffusion",
+        "direct_regression": "direct_regression",
+        "regression": "direct_regression",
+        "direct": "direct_regression",
+    }
+    if value not in aliases:
+        raise ValueError(
+            "Unsupported objective_type "
+            f"'{objective_type}'. Expected one of: diffusion, direct_regression."
+        )
+    return aliases[value]
+
+
+def _normalize_regression_loss(regression_loss: str) -> str:
+    value = str(regression_loss).strip().lower()
+    aliases = {
+        "mse": "mse",
+        "l2": "mse",
+        "l1": "l1",
+        "mae": "l1",
+        "gaussian_nll_fixed": "gaussian_nll_fixed",
+        "gaussian_nll": "gaussian_nll_fixed",
+    }
+    if value not in aliases:
+        raise ValueError(
+            "Unsupported regression_loss "
+            f"'{regression_loss}'. Expected one of: mse/l2, l1/mae, gaussian_nll_fixed."
+        )
+    return aliases[value]
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -92,6 +126,24 @@ def _diffusion_training_target(
     raise ValueError(f"Unsupported prediction type {pred_type}")
 
 
+def _direct_regression_loss(
+    regression_loss: str,
+    *,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    fixed_variance: float,
+) -> torch.Tensor:
+    normalized_loss = _normalize_regression_loss(regression_loss)
+    if normalized_loss == "mse":
+        return F.mse_loss(pred, target)
+    if normalized_loss == "l1":
+        return F.l1_loss(pred, target)
+    if normalized_loss == "gaussian_nll_fixed":
+        variance = torch.full_like(target, float(fixed_variance))
+        return F.gaussian_nll_loss(pred, target, variance, full=True)
+    raise ValueError(f"Unsupported regression loss {normalized_loss}")
+
+
 @dataclass
 class DiTEncDecDiffusionPolicyConfig:
     horizon: int
@@ -108,6 +160,9 @@ class DiTEncDecDiffusionPolicyConfig:
     scalar_embedding_hidden_dim: int = 128
     time_embedding_base: float = 10000.0
     diffusion_embedding_base: float = 10000.0
+    objective_type: str = "diffusion"
+    regression_loss: str = "mse"
+    regression_fixed_variance: float = 1.0
     prediction_type: str = "epsilon"
     num_inference_steps: int = 50
     noise_scheduler_kwargs: Dict[str, object] | None = None
@@ -117,6 +172,11 @@ class DiTEncDecDiffusionPolicy(nn.Module):
     def __init__(self, cfg: DiTEncDecDiffusionPolicyConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        self.objective_type = _normalize_objective_type(cfg.objective_type)
+        self.regression_loss = _normalize_regression_loss(cfg.regression_loss)
+        self.regression_fixed_variance = float(cfg.regression_fixed_variance)
+        if self.regression_fixed_variance <= 0:
+            raise ValueError("regression_fixed_variance must be positive.")
 
         encoder_transformer_cfg = EncoderTransformerConfig(
             hidden_dim=cfg.hidden_dim,
@@ -231,6 +291,34 @@ class DiTEncDecDiffusionPolicy(nn.Module):
         emb = self.diffusion_time_embedder(timesteps.float().unsqueeze(1))[:, 0, :]
         return self.diffusion_proj(emb)
 
+    def _predict_action_chunk(
+        self,
+        *,
+        context: torch.Tensor,
+        history: torch.Tensor,
+        future_slots: torch.Tensor,
+        query_mask: torch.Tensor,
+        context_mask: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        context_tokens = self._encode_context(context)
+        history_tokens = self._encode_history(history)
+        action_tokens = self._encode_actions(future_slots)
+        tokens = torch.cat([history_tokens, action_tokens], dim=1)
+
+        memory = self.encoder_transformer(
+            context_tokens, key_padding_mask=~context_mask
+        )
+        diffusion_cond = self._diffusion_condition(timesteps)
+        decoded = self.decoder_transformer(
+            tokens=tokens,
+            tokens_kpm=~query_mask,
+            memory=memory,
+            encoder_kpm=~context_mask,
+            diffusion_time_cond=diffusion_cond,
+        )
+        return self.output_head(decoded[:, -self.cfg.horizon :, :])
+
     def compute_loss(
         self, batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -242,45 +330,55 @@ class DiTEncDecDiffusionPolicy(nn.Module):
         query_mask = batch["query_mask"]
         context_mask = batch["context_mask"]
 
-        noise = torch.randn_like(actions)
-        timesteps = torch.randint(
-            0,
-            self.scheduler.config.num_train_timesteps,
-            (actions.shape[0],),
-            device=actions.device,
-            dtype=torch.long,
-        )
-        noisy_actions = self.scheduler.add_noise(x0, noise, timesteps)
+        if self.objective_type == "diffusion":
+            noise = torch.randn_like(actions)
+            timesteps = torch.randint(
+                0,
+                self.scheduler.config.num_train_timesteps,
+                (actions.shape[0],),
+                device=actions.device,
+                dtype=torch.long,
+            )
+            future_slots = self.scheduler.add_noise(x0, noise, timesteps)
+            pred = self._predict_action_chunk(
+                context=context,
+                history=history,
+                future_slots=future_slots,
+                query_mask=query_mask,
+                context_mask=context_mask,
+                timesteps=timesteps,
+            )
+            target = _diffusion_training_target(
+                self.scheduler,
+                x0=x0,
+                noise=noise,
+                timesteps=timesteps,
+            )
+            loss = F.mse_loss(pred, target)
+        else:
+            timesteps = torch.zeros(
+                (actions.shape[0],),
+                device=actions.device,
+                dtype=torch.long,
+            )
+            future_slots = torch.zeros_like(actions)
+            pred = self._predict_action_chunk(
+                context=context,
+                history=history,
+                future_slots=future_slots,
+                query_mask=query_mask,
+                context_mask=context_mask,
+                timesteps=timesteps,
+            )
+            target = x0
+            loss = _direct_regression_loss(
+                self.regression_loss,
+                pred=pred,
+                target=target,
+                fixed_variance=self.regression_fixed_variance,
+            )
 
-        context_tokens = self._encode_context(context)
-        history_tokens = self._encode_history(history)
-        action_tokens = self._encode_actions(noisy_actions)
-
-        tokens = torch.cat([history_tokens, action_tokens], dim=1)
-
-        memory = self.encoder_transformer(
-            context_tokens, key_padding_mask=~context_mask
-        )
-
-        diffusion_cond = self._diffusion_condition(timesteps)
-
-        decoded = self.decoder_transformer(
-            tokens=tokens,
-            tokens_kpm=~query_mask,
-            memory=memory,
-            encoder_kpm=~context_mask,
-            diffusion_time_cond=diffusion_cond,
-        )
-
-        pred = self.output_head(decoded[:, -self.cfg.horizon :, :])
-        target = _diffusion_training_target(
-            self.scheduler,
-            x0=x0,
-            noise=noise,
-            timesteps=timesteps,
-        )
-        loss = F.mse_loss(pred, target)
-        metrics = {"mse": float(loss.detach().cpu())}
+        metrics = {"loss": float(loss.detach().cpu())}
         return loss, metrics
 
     def forward(
@@ -315,6 +413,26 @@ class DiTEncDecDiffusionPolicy(nn.Module):
 
         device = context.device
         batch_size = context.shape[0]
+
+        if self.objective_type == "direct_regression":
+            timesteps = torch.zeros(
+                (batch_size,),
+                device=device,
+                dtype=torch.long,
+            )
+            future_slots = torch.zeros(
+                (batch_size, self.cfg.horizon, self.cfg.action_dim),
+                device=device,
+                dtype=history.dtype,
+            )
+            return self._predict_action_chunk(
+                context=context,
+                history=history,
+                future_slots=future_slots,
+                query_mask=history_mask,
+                context_mask=context_mask,
+                timesteps=timesteps,
+            )
 
         sample = torch.randn(
             (batch_size, self.cfg.horizon, self.cfg.action_dim),
@@ -374,6 +492,11 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
     def __init__(self, cfg: DiTEncDecDiffusionPolicyConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        self.objective_type = _normalize_objective_type(cfg.objective_type)
+        self.regression_loss = _normalize_regression_loss(cfg.regression_loss)
+        self.regression_fixed_variance = float(cfg.regression_fixed_variance)
+        if self.regression_fixed_variance <= 0:
+            raise ValueError("regression_fixed_variance must be positive.")
 
         encoder_transformer_cfg = EncoderTransformerConfig(
             hidden_dim=cfg.hidden_dim,
@@ -488,6 +611,34 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
         emb = self.diffusion_time_embedder(timesteps.float().unsqueeze(1))[:, 0, :]
         return self.diffusion_proj(emb)
 
+    def _predict_action_chunk(
+        self,
+        *,
+        context: torch.Tensor,
+        history: torch.Tensor,
+        future_slots: torch.Tensor,
+        query_mask: torch.Tensor,
+        context_mask: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        context_tokens = self._encode_context(context)
+        history_tokens = self._encode_history(history)
+        action_tokens = self._encode_actions(future_slots)
+        tokens = torch.cat([history_tokens, action_tokens], dim=1)
+
+        memory = self.encoder_transformer(
+            context_tokens, key_padding_mask=~context_mask
+        )
+        diffusion_cond = self._diffusion_condition(timesteps)
+        decoded = self.decoder_transformer(
+            tokens=tokens,
+            tokens_kpm=~query_mask,
+            memory=memory,
+            encoder_kpm=~context_mask,
+            diffusion_time_cond=diffusion_cond,
+        )
+        return self.output_head(decoded[:, -self.cfg.horizon :, :])
+
     def compute_loss(
         self, batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -499,53 +650,61 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
         query_mask = batch["query_mask"]
         context_mask = batch["context_mask"]
 
-        # ---- CHANGE #1: allow external noise/timesteps ----
-        noise = batch.get("noise", None)
-        if noise is None:
-            noise = torch.randn_like(actions)
+        if self.objective_type == "diffusion":
+            noise = batch.get("noise", None)
+            if noise is None:
+                noise = torch.randn_like(actions)
 
-        timesteps = batch.get("timesteps", None)
-        if timesteps is None:
-            timesteps = torch.randint(
-                0,
-                self.scheduler.config.num_train_timesteps,
+            timesteps = batch.get("timesteps", None)
+            if timesteps is None:
+                timesteps = torch.randint(
+                    0,
+                    self.scheduler.config.num_train_timesteps,
+                    (actions.shape[0],),
+                    device=actions.device,
+                    dtype=torch.long,
+                )
+
+            future_slots = self.scheduler.add_noise(x0, noise, timesteps)
+            pred = self._predict_action_chunk(
+                context=context,
+                history=history,
+                future_slots=future_slots,
+                query_mask=query_mask,
+                context_mask=context_mask,
+                timesteps=timesteps,
+            )
+            target = _diffusion_training_target(
+                self.scheduler,
+                x0=x0,
+                noise=noise,
+                timesteps=timesteps,
+            )
+            loss = F.mse_loss(pred, target)
+        else:
+            timesteps = torch.zeros(
                 (actions.shape[0],),
                 device=actions.device,
                 dtype=torch.long,
             )
-        # ---------------------------------------------------
+            future_slots = torch.zeros_like(actions)
+            pred = self._predict_action_chunk(
+                context=context,
+                history=history,
+                future_slots=future_slots,
+                query_mask=query_mask,
+                context_mask=context_mask,
+                timesteps=timesteps,
+            )
+            target = x0
+            loss = _direct_regression_loss(
+                self.regression_loss,
+                pred=pred,
+                target=target,
+                fixed_variance=self.regression_fixed_variance,
+            )
 
-        noisy_actions = self.scheduler.add_noise(x0, noise, timesteps)
-
-        context_tokens = self._encode_context(context)
-        history_tokens = self._encode_history(history)
-        action_tokens = self._encode_actions(noisy_actions)
-
-        tokens = torch.cat([history_tokens, action_tokens], dim=1)
-
-        memory = self.encoder_transformer(
-            context_tokens, key_padding_mask=~context_mask
-        )
-
-        diffusion_cond = self._diffusion_condition(timesteps)
-
-        decoded = self.decoder_transformer(
-            tokens=tokens,
-            tokens_kpm=~query_mask,
-            memory=memory,
-            encoder_kpm=~context_mask,
-            diffusion_time_cond=diffusion_cond,
-        )
-
-        pred = self.output_head(decoded[:, -self.cfg.horizon :, :])
-        target = _diffusion_training_target(
-            self.scheduler,
-            x0=x0,
-            noise=noise,
-            timesteps=timesteps,
-        )
-        loss = F.mse_loss(pred, target)
-        metrics = {"mse": float(loss.detach().cpu())}
+        metrics = {"loss": float(loss.detach().cpu())}
         return loss, metrics
 
     def loss_only(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -582,6 +741,26 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
 
         device = context.device
         batch_size = context.shape[0]
+
+        if self.objective_type == "direct_regression":
+            timesteps = torch.zeros(
+                (batch_size,),
+                device=device,
+                dtype=torch.long,
+            )
+            future_slots = torch.zeros(
+                (batch_size, self.cfg.horizon, self.cfg.action_dim),
+                device=device,
+                dtype=history.dtype,
+            )
+            return self._predict_action_chunk(
+                context=context,
+                history=history,
+                future_slots=future_slots,
+                query_mask=history_mask,
+                context_mask=context_mask,
+                timesteps=timesteps,
+            )
 
         sample = torch.randn(
             (batch_size, self.cfg.horizon, self.cfg.action_dim),
