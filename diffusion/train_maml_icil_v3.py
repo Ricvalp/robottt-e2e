@@ -989,6 +989,13 @@ def _clip_grads_in_list(grads: List[torch.Tensor], max_norm: float) -> List[torc
     return [g * scale if g is not None else None for g in grads]
 
 
+def _grad_list_global_norm(grads: List[torch.Tensor]) -> torch.Tensor:
+    norms = [g.detach().norm(2) for g in grads if g is not None]
+    if not norms:
+        return torch.tensor(0.0)
+    return torch.norm(torch.stack(norms), 2)
+
+
 def _sample_loo_indices(
     K: int,
     *,
@@ -1175,11 +1182,12 @@ def _adapt_fast_params_for_prepared_task(
     create_graph: bool,
     base_params: Optional[Dict[str, torch.Tensor]] = None,
     buffers: Optional[Dict[str, torch.Tensor]] = None,
-) -> Dict[str, torch.Tensor]:
+) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
     adapted_params = (
         base_params if base_params is not None else {k: v for k, v in model.named_parameters()}
     )
     buffers = buffers if buffers is not None else {k: v for k, v in model.named_buffers()}
+    grad_norms: List[torch.Tensor] = []
 
     for support_batch in prepared_task["support_batches"]:
         support_loss = functional_call(model, (adapted_params, buffers), (support_batch,))
@@ -1191,6 +1199,7 @@ def _adapt_fast_params_for_prepared_task(
             retain_graph=create_graph,
             allow_unused=False,
         )
+        grad_norms.append(_grad_list_global_norm(list(grads)))
         grads = _clip_grads_in_list(list(grads), cfg.max_grad_norm)
 
         new_params = dict(adapted_params)
@@ -1198,7 +1207,12 @@ def _adapt_fast_params_for_prepared_task(
             new_params[name] = p - cfg.inner_lr * g
         adapted_params = new_params
 
-    return adapted_params
+    if grad_norms:
+        mean_grad_norm = torch.stack(grad_norms).mean()
+    else:
+        mean_grad_norm = torch.tensor(0.0, device=next(iter(adapted_params.values())).device)
+
+    return adapted_params, mean_grad_norm
 
 
 def _copy_fast_params_into_model(
@@ -1223,7 +1237,7 @@ def maml_task_loss_second_order(
     horizon: int,
     base_params: Optional[Dict[str, torch.Tensor]] = None,
     buffers: Optional[Dict[str, torch.Tensor]] = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute meta-loss for one task:
       inner: adapt fast params on LOO support loss
@@ -1231,7 +1245,7 @@ def maml_task_loss_second_order(
     Returns scalar loss (requires grad).
     """
     buffers = buffers if buffers is not None else {k: v for k, v in model.named_buffers()}
-    adapted_params = _adapt_fast_params_for_prepared_task(
+    adapted_params, mean_grad_norm = _adapt_fast_params_for_prepared_task(
         model,
         prepared_task,
         fast_names=fast_names,
@@ -1241,7 +1255,7 @@ def maml_task_loss_second_order(
         buffers=buffers,
     )
     query_loss = functional_call(model, (adapted_params, buffers), (prepared_task["query_batch"],))
-    return query_loss
+    return query_loss, mean_grad_norm
 
 
 def _log_maml_eval_samples(
@@ -1379,15 +1393,16 @@ def maml_step(
     fast_names: List[str],
     cfg: MAMLConfig,
     horizon: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute mean meta-loss over an outer batch of tasks (keeps computation graph).
     """
     base_params = {k: v for k, v in model.named_parameters()}
     buffers = {k: v for k, v in model.named_buffers()}
     losses: List[torch.Tensor] = []
+    grad_norms: List[torch.Tensor] = []
     for prepared_task in prepared_tasks:
-        loss = maml_task_loss_second_order(
+        loss, grad_norm = maml_task_loss_second_order(
             model,
             prepared_task,
             fast_names=fast_names,
@@ -1397,7 +1412,14 @@ def maml_step(
             buffers=buffers,
         )
         losses.append(loss)
-    return torch.stack(losses).mean()
+        grad_norms.append(grad_norm)
+    meta_loss = torch.stack(losses).mean()
+    mean_fast_grad_norm = (
+        torch.stack(grad_norms).mean()
+        if grad_norms
+        else torch.tensor(0.0, device=meta_loss.device)
+    )
+    return meta_loss, mean_fast_grad_norm
 
 
 # -------------------------
@@ -1705,7 +1727,7 @@ def main(argv: List[str] | None = None) -> None:
 
             # Force math attention for second-order meta-gradients (safer)
             with _maml_attention_ctx(cfg, device):
-                meta_loss = maml_step(
+                meta_loss, inner_fast_grad_norm = maml_step(
                     policy,
                     prepared_tasks=prepared_tasks,
                     fast_names=fast_names,
@@ -1723,9 +1745,19 @@ def main(argv: List[str] | None = None) -> None:
             pg.stop(global_step)
 
             if global_step % config.logging.log_loss_every == 0:
-                print(f"[epoch {epoch:03d} step {global_step:06d}] meta_loss={meta_loss.item():.6f}")
+                print(
+                    f"[epoch {epoch:03d} step {global_step:06d}] "
+                    f"meta_loss={meta_loss.item():.6f} "
+                    f"inner_fast_grad_norm={inner_fast_grad_norm.item():.6f}"
+                )
                 if config.wandb.use and wandb.run is not None:
-                    wandb.log({"train/meta_loss": meta_loss.item()}, step=global_step)
+                    wandb.log(
+                        {
+                            "train/meta_loss": meta_loss.item(),
+                            "train/inner_fast_grad_norm": inner_fast_grad_norm.item(),
+                        },
+                        step=global_step,
+                    )
 
             if config.wandb.use and wandb.run is not None and (global_step % config.wandb.samples_log_interval == 0):
                 with torch.no_grad():
