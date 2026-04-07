@@ -319,10 +319,27 @@ class DiTEncDecDiffusionPolicy(nn.Module):
         )
         return self.output_head(decoded[:, -self.cfg.horizon :, :])
 
-    def compute_loss(
-        self, batch: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def predict_denoising_step(
+        self,
+        *,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        history: torch.Tensor,
+        history_mask: torch.Tensor,
+        future_slots: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict the model output for one denoising/regression step."""
+        return self._predict_action_chunk(
+            context=context,
+            history=history,
+            future_slots=future_slots,
+            query_mask=history_mask,
+            context_mask=context_mask,
+            timesteps=timesteps,
+        )
 
+    def _compute_loss_tensor(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         context = batch["context"]
         history = batch["history"]
         actions = batch["actions"]
@@ -378,6 +395,12 @@ class DiTEncDecDiffusionPolicy(nn.Module):
                 fixed_variance=self.regression_fixed_variance,
             )
 
+        return loss
+
+    def compute_loss(
+        self, batch: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        loss = self._compute_loss_tensor(batch)
         metrics = {"loss": float(loss.detach().cpu())}
         return loss, metrics
 
@@ -639,10 +662,27 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
         )
         return self.output_head(decoded[:, -self.cfg.horizon :, :])
 
-    def compute_loss(
-        self, batch: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def predict_denoising_step(
+        self,
+        *,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        history: torch.Tensor,
+        history_mask: torch.Tensor,
+        future_slots: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict the model output for one denoising/regression step."""
+        return self._predict_action_chunk(
+            context=context,
+            history=history,
+            future_slots=future_slots,
+            query_mask=history_mask,
+            context_mask=context_mask,
+            timesteps=timesteps,
+        )
 
+    def _compute_loss_tensor(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         context = batch["context"]
         history = batch["history"]
         actions = batch["actions"]
@@ -704,12 +744,17 @@ class MAMLDiTEncDecDiffusionPolicy(nn.Module):
                 fixed_variance=self.regression_fixed_variance,
             )
 
+        return loss
+
+    def compute_loss(
+        self, batch: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        loss = self._compute_loss_tensor(batch)
         metrics = {"loss": float(loss.detach().cpu())}
         return loss, metrics
 
     def loss_only(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        loss, _ = self.compute_loss(batch)
-        return loss
+        return self._compute_loss_tensor(batch)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         return self.loss_only(batch)
